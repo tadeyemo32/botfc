@@ -1,0 +1,13 @@
+# Bot FC – Robot Configuration
+robot:
+  ip: "10.85.8.57"
+  port: 9559
+  username: "nao"
+  password: "Na0Na0"
+
+# NAOqi path on the robot
+naoqi_path: "/opt/aldebaran/lib/python2.7/site-packages"
+
+# API server
+server:
+  port: 5050
