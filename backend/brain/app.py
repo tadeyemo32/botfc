@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-
-from naoqi import ALProxy
-=======
-
+"""
 Brain – entry point.
 
 Modes:
@@ -10,10 +6,9 @@ Modes:
   python app.py --serve      → Start Flask API on :5050
   python app.py --football   → Deploy football agent directly
   python app.py --football --trait=offense
-
+"""""
 import logging
 import os
->>>>>>> 658629f625f3e6b33e6f8cd9195571de9aee9b5d
 import sys
 import time
 
@@ -72,8 +67,6 @@ def run_football(trait="balanced"):
 
 
 if __name__ == "__main__":
-
-=======
     if "--serve" in sys.argv:
         sys.path.insert(0, os.path.join(BASE_DIR, "..", "api"))
         from server import app
@@ -89,4 +82,3 @@ if __name__ == "__main__":
 
     else:
         test_hello()
->>>>>>> 658629f625f3e6b33e6f8cd9195571de9aee9b5d
