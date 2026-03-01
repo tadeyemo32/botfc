@@ -100,6 +100,7 @@ ROLE_DEFENDER = "DEFENDER"
 ROLE_BALANCED = "BALANCED"
 
 STATE_INIT     = "INIT"
+STATE_STANDBY  = "STANDBY"
 STATE_SEARCH   = "SEARCH"
 STATE_APPROACH = "APPROACH"
 STATE_ALIGN    = "ALIGN"
@@ -883,10 +884,14 @@ class BotFCBrain(object):
         self.last_ball_time = time.time()  # start grace period from NOW, not -100s
 
         with self.lock:
-            self.state = STATE_SEARCH
+            self.state = STATE_STANDBY
 
         self.running = True
-        self.data_logger.start()
+        # data_logger subscribes camera 0 with kRGB (format 9) which conflicts
+        # with CameraStreamer (kJpeg, format 21) on the same physical camera,
+        # causing empty frames.  Keep data_logger stopped; telemetry is still
+        # updated in-memory and logged via update_telemetry / log_game_state.
+        # self.data_logger.start()
         self.telemetry_client.start(self.trait)
         self.camera_streamer.start()
         self.command_poller.start()
@@ -969,7 +974,7 @@ class BotFCBrain(object):
                 if srv_cmd == "STOP":
                     self.motion.stopMove()
                     with self.lock:
-                        self.state = STATE_SEARCH
+                        self.state = STATE_STANDBY
                 elif srv_cmd in (STATE_SEARCH, STATE_APPROACH, STATE_ALIGN, STATE_KICK):
                     with self.lock:
                         self.state = srv_cmd
@@ -992,7 +997,7 @@ class BotFCBrain(object):
                 if self.running:
                     self._ensure_standing()
                     with self.lock:
-                        self.state = STATE_SEARCH
+                        self.state = STATE_STANDBY
                 continue
 
             # ── Fall recovery (mid-match) ──────────────────────────────────
@@ -1010,7 +1015,7 @@ class BotFCBrain(object):
                 except Exception:
                     pass
                 with self.lock:
-                    self.state = STATE_SEARCH
+                    self.state = STATE_STANDBY
                 continue
 
             self._safety_check()
@@ -1072,14 +1077,15 @@ class BotFCBrain(object):
             if s != STATE_HALFTIME:
                 self._enforce_bounds()
 
-                if   s == STATE_SEARCH:   self._do_search()
+                if   s == STATE_STANDBY:  pass   # wait for SEARCH command from operator
+                elif s == STATE_SEARCH:   self._do_search()
                 elif s == STATE_APPROACH: self._do_approach()
                 elif s == STATE_ALIGN:    self._do_align()
                 elif s == STATE_KICK:     self._do_kick()
                 elif s == STATE_TACKLE:   self._do_tackle()
                 else:
                     with self.lock:
-                        self.state = STATE_SEARCH
+                        self.state = STATE_STANDBY
 
             time.sleep(0.05)
 

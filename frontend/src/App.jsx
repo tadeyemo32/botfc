@@ -5,7 +5,7 @@ const SERVER = "http://localhost:5050";
 const WS     = "ws://localhost:5050";
 
 const STATE_COLORS = {
-  IDLE: "#4d7a60", SEARCH: "#ffcc00", APPROACH: "#a8ff4d",
+  IDLE: "#4d7a60", STANDBY: "#3d6a50", SEARCH: "#ffcc00", APPROACH: "#a8ff4d",
   ALIGN: "#4d9fff", TACKLE: "#ff6b35", KICK: "#ffffff",
   HALFTIME: "#ff6600", RECOVER: "#ff4d4d", INIT: "#666",
 };
@@ -599,13 +599,9 @@ export default function App() {
             </div>
           )}
 
-          {/* Live state – camera hero + controls */}
+          {/* Live state – controls (camera stays in sidebar) */}
           {matchState === "live" && (
             <div style={{ display: "flex", flexDirection: "column", gap: 10, animation: "fadeUp 0.3s ease" }}>
-              {/* Camera hero in main area when live */}
-              <div style={{ position: "relative", borderRadius: 4, overflow: "hidden", border: "1px solid #a8ff4d20", animation: "livePulse 3s infinite" }}>
-                <CameraFeed telemetry={{}} compact={false} />
-              </div>
               <div style={{ padding: "12px 16px", background: "#040a05", border: "1px solid #a8ff4d20", borderRadius: 4, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div>
                   <div style={{ fontSize: "0.5rem", color: "#3d6a50", letterSpacing: "0.2em", fontFamily: "'Share Tech Mono', monospace" }}>MATCH IN PROGRESS</div>
@@ -634,7 +630,7 @@ export default function App() {
 
         {/* ── Right: telemetry panel ── */}
         <div style={{ padding: "1rem", overflowY: "auto", borderLeft: "1px solid #0d2010", background: "#020e05" }}>
-          <TelemetryPanel showCamera={matchState !== "live"} />
+          <TelemetryPanel />
         </div>
       </div>
     </div>
