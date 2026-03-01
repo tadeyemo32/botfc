@@ -1776,7 +1776,8 @@ class BotFCBrain(object):
             mask = mask1 + mask2
             
             # Find contours
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cnts = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = cnts[1] if len(cnts) == 3 else cnts[0]
             
             best_blob = None
             max_area = 0
@@ -1863,7 +1864,8 @@ class BotFCBrain(object):
             
             mask = cv2.bitwise_or(mask_yellow, mask_white)
             
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cnts = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours = cnts[1] if len(cnts) == 3 else cnts[0]
             
             posts = []
             for cnt in contours:
