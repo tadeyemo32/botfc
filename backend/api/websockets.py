@@ -1,6 +1,7 @@
 """WebSocket endpoints – replaces WsSession.cpp role-based handlers."""
 
 import json
+import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -8,12 +9,14 @@ from .decision import compute_decision
 from .state import store
 
 router = APIRouter()
+log = logging.getLogger("botfc.ws")
 
 
 @router.websocket("/ws/bot")
 async def ws_bot(ws: WebSocket):
     """Robot sends telemetry JSON. Server updates store and broadcasts to frontends."""
     await ws.accept()
+    log.info("Bot telemetry connected: %s", ws.client)
     try:
         while True:
             msg = await ws.receive_text()
@@ -25,21 +28,26 @@ async def ws_bot(ws: WebSocket):
                 await store.broadcast_telemetry(json.dumps(telem))
             except json.JSONDecodeError:
                 pass
-    except WebSocketDisconnect:
+    except Exception:
         pass
+    finally:
+        log.info("Bot telemetry disconnected: %s", ws.client)
 
 
 @router.websocket("/ws/bot_camera")
 async def ws_bot_camera(ws: WebSocket):
     """Robot sends camera frame JSON. Server stores + relays to camera viewers."""
     await ws.accept()
+    log.info("Bot camera connected: %s", ws.client)
     try:
         while True:
             msg = await ws.receive_text()
             await store.set_frame(msg)
             await store.broadcast_frame(msg)
-    except WebSocketDisconnect:
+    except Exception:
         pass
+    finally:
+        log.info("Bot camera disconnected: %s", ws.client)
 
 
 @router.websocket("/ws/frontend")
@@ -47,17 +55,13 @@ async def ws_frontend(ws: WebSocket):
     """Browser connects to receive telemetry updates."""
     await ws.accept()
     await store.add_frontend(ws)
-    # Push current telemetry immediately
     telem = await store.get_telemetry()
     try:
         await ws.send_text(json.dumps(telem))
-    except Exception:
-        pass
-    try:
         while True:
-            # Frontend is receive-only; ignore messages but keep alive
+            # Frontend is receive-only; drain any messages to keep alive
             await ws.receive_text()
-    except WebSocketDisconnect:
+    except Exception:
         pass
     finally:
         await store.remove_frontend(ws)
@@ -78,7 +82,7 @@ async def ws_camera_feed(ws: WebSocket):
     try:
         while True:
             await ws.receive_text()
-    except WebSocketDisconnect:
+    except Exception:
         pass
     finally:
         await store.remove_camera(ws)
