@@ -144,15 +144,15 @@ function CameraFeed({ telemetry, compact = false }) {
             {connected
               ? <>
                   <div style={{ width: 36, height: 36, border: "2px solid #0d2010", borderTopColor: "#ffcc00", borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
-                  <div style={{ color: "#1a3a2a", fontSize: "0.6rem", letterSpacing: "0.2em", fontFamily: "'Share Tech Mono', monospace", textAlign: "center", lineHeight: 1.8 }}>
+                  <div style={{ color: "#3d6a50", fontSize: "0.6rem", letterSpacing: "0.2em", fontFamily: "'Share Tech Mono', monospace", textAlign: "center", lineHeight: 1.8 }}>
                     AWAITING ROBOT CAMERA<br/>
-                    <span style={{ color: "#0d2010", fontSize: "0.5rem" }}>RUN ./run.sh TO DEPLOY BRAIN</span>
+                    <span style={{ color: "#1a3a2a", fontSize: "0.5rem" }}>CLICK KICK OFF TO DEPLOY BRAIN</span>
                   </div>
                 </>
-              : <>
-                  <div style={{ width: 36, height: 36, border: "2px solid #0d2010", borderTopColor: "#ff4d4d44", borderRadius: "50%", animation: "spin 2s linear infinite" }} />
-                  <div style={{ color: "#1a3a2a", fontSize: "0.6rem", letterSpacing: "0.2em", fontFamily: "'Share Tech Mono', monospace" }}>SERVER OFFLINE</div>
-                </>
+              : <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+                  <div style={{ fontSize: "1.4rem", color: "#0d2010" }}>◯</div>
+                  <div style={{ color: "#0d2010", fontSize: "0.55rem", letterSpacing: "0.25em", fontFamily: "'Share Tech Mono', monospace" }}>SERVER OFFLINE</div>
+                </div>
             }
           </div>
       }

@@ -488,7 +488,8 @@ class CameraStreamer(object):
     WebSocket /api/ws/bot_camera.  The server stores the latest frame and
     relays it to browser clients on /api/ws/camera_feed.
 
-    Uses kJpegColorSpace=21 so no re-encoding is needed on the robot.
+    Tries kJpegColorSpace (21) first for zero-CPU hardware encoding.
+    Falls back to kRGBColorSpace (11) + PIL if JPEG frames are invalid.
     """
 
     def __init__(self, robot_ip, robot_port, server_host, server_port):
@@ -500,24 +501,47 @@ class CameraStreamer(object):
         self.thread      = None
         self._vid        = None
         self._cam_client = ""
+        self._fmt        = STREAM_CAM_FORMAT  # active format (21 or 11)
 
     def start(self):
         if self.running:
             return
         try:
             self._vid = ALProxy("ALVideoDevice", self.robot_ip, self.robot_port)
-            self._cam_client = self._vid.subscribeCamera(
-                "BotFC_Stream", STREAM_CAM_ID, STREAM_CAM_RES,
-                STREAM_CAM_FORMAT, STREAM_CAM_FPS)
         except Exception as e:
-            print("[CamStream] Camera init failed: {}".format(e))
+            print("[CamStream] ALVideoDevice unavailable: {}".format(e))
             return
+
+        # Try kJpegColorSpace (21) first; if it fails fall back to kRGBColorSpace (11)
+        for fmt, label in ((21, "kJpeg"), (11, "kRGB")):
+            try:
+                # Remove any stale subscription that might block the slot
+                try:
+                    self._vid.unsubscribe("BotFC_Stream")
+                except Exception:
+                    pass
+                handle = self._vid.subscribeCamera(
+                    "BotFC_Stream", STREAM_CAM_ID, STREAM_CAM_RES, fmt, STREAM_CAM_FPS)
+                if handle:
+                    self._cam_client = handle
+                    self._fmt = fmt
+                    print("[CamStream] Subscribed fmt={} ({}) handle='{}'".format(
+                        fmt, label, handle))
+                    break
+                print("[CamStream] subscribeCamera fmt={} returned empty handle.".format(fmt))
+            except Exception as e:
+                print("[CamStream] subscribeCamera fmt={} failed: {}".format(fmt, e))
+
+        if not self._cam_client:
+            print("[CamStream] Camera unavailable – stream disabled.")
+            return
+
         self.running = True
         self.thread  = threading.Thread(target=self._loop)
         self.thread.daemon = True
         self.thread.start()
-        print("[CamStream] Started JPEG stream to {}:{}.".format(
-            self.server_host, self.server_port))
+        print("[CamStream] Streaming fmt={} -> {}:{}".format(
+            self._fmt, self.server_host, self.server_port))
 
     def stop(self):
         self.running = False
@@ -529,6 +553,35 @@ class CameraStreamer(object):
             except Exception:
                 pass
 
+    def _to_jpeg(self, img):
+        """Return (jpg_bytes, w, h) from a NAOqi image tuple, or (None, 0, 0)."""
+        if not img or len(img) <= 6:
+            return None, 0, 0
+        w, h, raw = int(img[0]), int(img[1]), img[6]
+        if not raw:
+            return None, w, h
+
+        if self._fmt == 21:  # kJpegColorSpace: img[6] is already JPEG bytes
+            jpg = bytes(bytearray(raw))
+            # Validate JPEG SOI marker (0xFF 0xD8)
+            if len(jpg) < 3 or bytearray(jpg[:2]) != bytearray([0xff, 0xd8]):
+                print("[CamStream] Invalid JPEG header (len={}) – bad frame".format(len(jpg)))
+                return None, w, h
+            return jpg, w, h
+
+        # kRGBColorSpace (11): encode via PIL
+        try:
+            import StringIO as _sio
+            from PIL import Image as _Img
+            rgb     = bytes(bytearray(raw))
+            pil_img = _Img.frombytes("RGB", (w, h), rgb)
+            buf     = _sio.StringIO()
+            pil_img.save(buf, format="JPEG", quality=75)
+            return buf.getvalue(), w, h
+        except Exception as enc_e:
+            print("[CamStream] PIL encode error: {}".format(enc_e))
+            return None, w, h
+
     def _loop(self):
         import socket as _socket
         import base64 as _b64
@@ -537,10 +590,10 @@ class CameraStreamer(object):
             sock = None
             try:
                 sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-                sock.settimeout(5)
+                sock.settimeout(5)   # connect + handshake timeout only
                 sock.connect((self.server_host, self.server_port))
 
-                ws_key = _b64.b64encode(os.urandom(16))
+                ws_key    = _b64.b64encode(os.urandom(16))
                 handshake = (
                     "GET /api/ws/bot_camera HTTP/1.1\r\n"
                     "Host: {host}:{port}\r\n"
@@ -557,26 +610,46 @@ class CameraStreamer(object):
                 while b"\r\n\r\n" not in resp:
                     chunk = sock.recv(4096)
                     if not chunk:
-                        raise Exception("Handshake failed")
+                        raise Exception("Handshake EOF")
                     resp += chunk
 
                 if b"101" not in resp.split(b"\r\n")[0]:
-                    raise Exception("WS upgrade rejected")
+                    raise Exception("WS upgrade rejected: {}".format(
+                        resp.split(b"\r\n")[0].decode("utf-8", errors="replace")))
 
-                print("[CamStream] Connected.")
+                # Remove timeout for the streaming phase so large frames don't abort
+                sock.settimeout(None)
+                print("[CamStream] WS connected. Streaming fmt={} @ {}fps".format(
+                    self._fmt, STREAM_CAM_FPS))
 
-                interval = 1.0 / STREAM_CAM_FPS
+                interval   = 1.0 / STREAM_CAM_FPS
+                bad_frames = 0
+
                 while self.running:
+                    t0  = time.time()
                     img = self._vid.getImageRemote(self._cam_client)
-                    if img and len(img) > 6:
-                        w   = int(img[0])
-                        h   = int(img[1])
-                        jpg = bytes(bytearray(img[6]))
-                        b64 = _b64.b64encode(jpg).decode("ascii")
+                    jpg, w, h = self._to_jpeg(img)
+
+                    if img:
+                        try:
+                            self._vid.releaseImage(self._cam_client)
+                        except Exception:
+                            pass
+
+                    if jpg:
+                        bad_frames = 0
+                        b64     = _b64.b64encode(jpg).decode("ascii")
                         payload = json.dumps({"type": "frame", "w": w, "h": h, "jpg": b64})
                         TelemetryClient._ws_send(sock, payload)
-                        self._vid.releaseImage(self._cam_client)
-                    time.sleep(interval)
+                    else:
+                        bad_frames += 1
+                        if bad_frames == 5:
+                            print("[CamStream] {} consecutive bad frames – "
+                                  "camera may need different format.".format(bad_frames))
+
+                    wait = interval - (time.time() - t0)
+                    if wait > 0:
+                        time.sleep(wait)
 
                 TelemetryClient._ws_close(sock)
             except Exception as e:
