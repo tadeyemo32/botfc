@@ -8,7 +8,7 @@
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CONFIG="$SCRIPT_DIR/config/robot.yaml"
-BRAIN="$SCRIPT_DIR/backend/src/brain/botfc_brain.py"
+BRAIN="$SCRIPT_DIR/backend/brain/botfc_brain.py"
 
 # Parse robot.yaml (simple grep-based, works without pyyaml)
 ROBOT_IP=$(grep 'ip:' "$CONFIG" | head -1 | sed 's/.*"\(.*\)".*/\1/')

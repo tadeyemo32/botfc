@@ -71,3 +71,6 @@ venv.bak/
 
 # AI Context (User requested)
 context/
+
+# Build artifacts
+bin/
