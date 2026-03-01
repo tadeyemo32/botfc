@@ -821,13 +821,17 @@ class BotFCBrain(object):
             self.motion   = ALProxy("ALMotion",         self.robot_ip, self.robot_port)
             self.posture  = ALProxy("ALRobotPosture",   self.robot_ip, self.robot_port)
             self.memory   = ALProxy("ALMemory",         self.robot_ip, self.robot_port)
-            self.tts      = ALProxy("ALTextToSpeech",   self.robot_ip, self.robot_port)
             self.leds     = ALProxy("ALLeds",           self.robot_ip, self.robot_port)
             self.ball_det = ALProxy("ALRedBallDetection", self.robot_ip, self.robot_port)
             self.sonar_p  = ALProxy("ALSonar",          self.robot_ip, self.robot_port)
         except Exception as e:
             print("[BotFC] FATAL: Failed to init proxies: {}".format(e))
             return
+
+        try:
+            self.tts = ALProxy("ALTextToSpeech", self.robot_ip, self.robot_port)
+        except Exception as e:
+            print("[BotFC] ALTextToSpeech unavailable (muted mode): {}".format(e))
 
         try:
             self.battery = ALProxy("ALBattery", self.robot_ip, self.robot_port)
@@ -867,7 +871,8 @@ class BotFCBrain(object):
         except Exception as e:
             print("[BotFC] Bottom camera unavailable: {}".format(e))
 
-        self.tts.post.say("Brain online. Let's play football.")
+        if self.tts:
+            self.tts.post.say("Brain online. Let's play football.")
 
         try:
             p = self.motion.getRobotPosition(True)
@@ -1254,7 +1259,8 @@ class BotFCBrain(object):
         else:
             phrase = "Motors at {}. I need a {} second break.".format(int(max_t), secs)
 
-        self.tts.post.say(phrase)
+        if self.tts:
+            self.tts.post.say(phrase)
         self.leds.fadeRGB("AllLeds", 0xFFA200, 0.15)
         self.posture.goToPosture("Crouch", 0.8)
         self.motion.setStiffnesses("Body", 0.0)
@@ -1267,7 +1273,7 @@ class BotFCBrain(object):
                 break
             with self.lock:
                 self.break_remaining = r
-            if r % 30 == 0:
+            if r % 30 == 0 and self.tts:
                 self.tts.post.say("{} minutes remaining.".format(r // 60))
             time.sleep(1)
 
@@ -1275,7 +1281,8 @@ class BotFCBrain(object):
             self.break_remaining = 0
 
         if self.running:
-            self.tts.post.say("Cooling complete.")
+            if self.tts:
+                self.tts.post.say("Cooling complete.")
             self.motion.setStiffnesses("Body", 1.0)
             self.posture.goToPosture("StandInit", 1.0)
             with self.lock:
@@ -1308,7 +1315,8 @@ class BotFCBrain(object):
                     self.last_ball_time = time.time()
                     self.state = STATE_APPROACH
                 self.motion.setAngles("HeadPitch", 0.15, 0.2)
-                self.tts.post.say("Ball found!")
+                if self.tts:
+                    self.tts.post.say("Ball found!")
                 return
             # Single-frame ghost: fall through and keep sweeping.
 
@@ -1350,7 +1358,8 @@ class BotFCBrain(object):
 
         now = time.time()
         if now - self.last_man_on_time > 4.0:
-            self.tts.post.say("Man on, man on")
+            if self.tts:
+                self.tts.post.say("Man on, man on")
             self.last_man_on_time = now
 
         # Update model if a fresh reading exists.
@@ -1441,7 +1450,8 @@ class BotFCBrain(object):
 
         now = time.time()
         if now - self.last_man_on_time > 4.0:
-            self.tts.post.say("Man on, man on")
+            if self.tts:
+                self.tts.post.say("Man on, man on")
             self.last_man_on_time = now
 
         # In ALIGN we prioritise the bottom camera but still accept top-cam data.
@@ -1485,7 +1495,8 @@ class BotFCBrain(object):
         # ── Kick-ready transition ─────────────────────────────────────────
         if abs(bx) < KICK_BX_MAX and bsz > KICK_BSZ_READY:
             self.motion.stopMove()
-            self.tts.post.say("I see the goal")
+            if self.tts:
+                self.tts.post.say("I see the goal")
             with self.lock:
                 self.state = STATE_KICK
             return
@@ -1506,7 +1517,8 @@ class BotFCBrain(object):
     def _do_tackle(self):
         self.leds.fadeRGB("AllLeds", 0xFF0000, 0.15)
         try:
-            self.tts.post.say("Pushing!")
+            if self.tts:
+                self.tts.post.say("Pushing!")
             self.motion.setStiffnesses("Body", 1.0)
             self.posture.goToPosture("StandInit", 0.8)
             self.motion.setAngles(["LShoulderPitch", "RShoulderPitch"], [0.0, 0.0], 0.3)
@@ -1584,7 +1596,8 @@ class BotFCBrain(object):
         side_step_y = -0.04 if bx < -0.02 else 0.04
         kick_leg    = "L"   if bx < -0.02 else "R"
 
-        self.tts.post.say("Kick!")
+        if self.tts:
+            self.tts.post.say("Kick!")
 
         try:
             self.posture.goToPosture("Stand", 0.8)
