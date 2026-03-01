@@ -2435,7 +2435,7 @@ class BotFCBrain(object):
 
         # ── State transitions ──────────────────────────────────────────
         # Switch to ORBIT instead of ALIGN when getting close (bsz ~0.5m away)
-        if bsz >= KICK_BSZ_READY * 0.5:
+        if self.ball_model.bsz >= KICK_BSZ_READY * 0.5:
             self.motion.stopMove()
             with self.lock:
                 self.state = STATE_ORBIT
