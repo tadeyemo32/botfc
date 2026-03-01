@@ -89,28 +89,37 @@ class State:
             self.camera_sessions.discard(ws)
 
     # ── Broadcast helpers ─────────────────────────────────────
+    # Copy the session set under the lock, then release it before doing
+    # async network IO.  Holding asyncio.Lock across awaited sends blocks
+    # all other coroutines that need the lock (session add/remove).
 
     async def broadcast_telemetry(self, msg: str):
         async with self._lock:
-            dead = []
-            for ws in self.frontend_sessions:
-                try:
-                    await ws.send_text(msg)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.frontend_sessions.discard(ws)
+            sessions = frozenset(self.frontend_sessions)
+        dead = []
+        for ws in sessions:
+            try:
+                await ws.send_text(msg)
+            except Exception:
+                dead.append(ws)
+        if dead:
+            async with self._lock:
+                for ws in dead:
+                    self.frontend_sessions.discard(ws)
 
     async def broadcast_frame(self, frame_json: str):
         async with self._lock:
-            dead = []
-            for ws in self.camera_sessions:
-                try:
-                    await ws.send_text(frame_json)
-                except Exception:
-                    dead.append(ws)
-            for ws in dead:
-                self.camera_sessions.discard(ws)
+            sessions = frozenset(self.camera_sessions)
+        dead = []
+        for ws in sessions:
+            try:
+                await ws.send_text(frame_json)
+            except Exception:
+                dead.append(ws)
+        if dead:
+            async with self._lock:
+                for ws in dead:
+                    self.camera_sessions.discard(ws)
 
 
 store = State()
