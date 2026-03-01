@@ -63,7 +63,7 @@ BALL_CONF_RAMP    = 1.5    # seconds of continuous tracking to reach full confid
 # ─────────────────────────────────────────────
 # Head-tracking / approach constants
 # ─────────────────────────────────────────────
-HEAD_TRACK_GAIN       = 0.55   # head servo gain (rad / bx unit)
+HEAD_TRACK_GAIN       = 1.15   # tighter aimbot tracking (was 0.55)
 BODY_FOLLOW_THRESHOLD = 0.12   # |head_yaw| above which we rotate before walking
 ALIGN_BODY_DEADBAND   = 0.06   # bx dead-zone in ALIGN to kill oscillation
 
@@ -105,10 +105,15 @@ DEFAULT_GOAL_BEARING = 0.0    # straight ahead
 # top-camera ALRedBallDetection subscription.
 # ─────────────────────────────────────────────
 BOT_CAM_ID      = 1    # bottom camera
+TOP_CAM_ID      = 0    # top camera
 BOT_CAM_RES     = 1    # kQVGA  (320 × 240)
 BOT_CAM_FORMAT  = 13   # kBGR
 BOT_CAM_FPS     = 10
 BOT_CAM_STRIDE  = 4    # check every Nth pixel (speed vs accuracy)
+TOP_CAM_HFOV    = 1.064  # ~60.9 deg
+TOP_CAM_VFOV    = 0.831  # ~47.6 deg
+BOT_CAM_HFOV    = 0.831  # ~47.6 deg
+BOT_CAM_VFOV    = 0.665  # ~38.1 deg
 
 # Red-ball thresholds in BGR colour space.
 # Tune RED_R_MIN downward if the robot misses the ball under warm/dim lighting.
@@ -158,6 +163,7 @@ ROLE_BALANCED = "BALANCED"
 STATE_INIT      = "INIT"
 STATE_SEARCH    = "SEARCH"
 STATE_APPROACH  = "APPROACH"
+STATE_ORBIT     = "ORBIT"
 STATE_ALIGN     = "ALIGN"
 STATE_TACKLE    = "TACKLE"
 STATE_KICK      = "KICK"
@@ -239,9 +245,9 @@ class BallModel(object):
             self._tracking_since = now
 
         self.dist = max(0.1, BALL_K_CONST / max(self._bsz, 0.001))
-        # NAO convention: HeadYaw positive=left, bx positive=right-of-center.
-        # World heading of ball = head_yaw MINUS bx (both in rad approx).
-        self.last_heading = head_yaw - self._bx
+        # NAO convention: HeadYaw positive=left, bx positive=left.
+        # World heading of ball = head_yaw PLUS bx
+        self.last_heading = head_yaw + self._bx
         self.valid        = True
         self.last_seen    = now
         self._last_update_t = now
@@ -1078,11 +1084,22 @@ class BotFCBrain(object):
 
         # Ball perception
         self._last_ball_ts     = None     # NAOqi timestamp guard (stale detection)
+        
+        # Load C++ ML Inference Bridge (if available)
+        self.ml_inference = None
+        try:
+            sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'ml'))
+            from botfc_ml import BotFCInference
+            self.ml_inference = BotFCInference("botfc_model.tflite")
+            print("[BotFC] Loaded C++ ML Inference Bridge successfully.")
+        except Exception as e:
+            print("[BotFC] Could not load C++ ML Bridge (it's okay, will use P-Controllers instead): " + str(e))
         self.ball_model        = BallModel()
 
         # Bottom camera
         self._vid              = None     # ALVideoDevice proxy
         self._bot_cam_client   = ""       # subscription name
+        self._top_cam_client   = ""
 
         # Stability controller
         self.stability = StabilityController()
@@ -1396,15 +1413,16 @@ class BotFCBrain(object):
         except Exception:
             pass
 
-        # Bottom camera – separate subscription so we can query it in align/kick
-        # even when ALRedBallDetection is using the top camera.
+        # Cameras – subscribe to both via ALVideoDevice for reliable OpenCV processing
         try:
             self._vid = ALProxy("ALVideoDevice", self.robot_ip, self.robot_port)
             self._bot_cam_client = self._vid.subscribeCamera(
                 "BotFC_BottomDetect", BOT_CAM_ID, BOT_CAM_RES, BOT_CAM_FORMAT, BOT_CAM_FPS)
-            print("[BotFC] Bottom camera subscribed.")
+            self._top_cam_client = self._vid.subscribeCamera(
+                "BotFC_TopDetect", TOP_CAM_ID, BOT_CAM_RES, BOT_CAM_FORMAT, BOT_CAM_FPS)
+            print("[BotFC] Both cameras subscribed via ALVideoDevice.")
         except Exception as e:
-            print("[BotFC] Bottom camera unavailable: {}".format(e))
+            print("[BotFC] Camera unavailable: {}".format(e))
 
         self.tts.post.say("Brain online. Let's play football.")
 
@@ -1444,12 +1462,14 @@ class BotFCBrain(object):
         if self.fsm_thread and self.fsm_thread.is_alive():
             self.fsm_thread.join(timeout=5)
 
-        # Unsubscribe bottom camera
-        if self._vid and self._bot_cam_client:
-            try:
-                self._vid.unsubscribe(self._bot_cam_client)
-            except Exception:
-                pass
+        # Unsubscribe cameras
+        if self._vid:
+            if getattr(self, '_bot_cam_client', None):
+                try: self._vid.unsubscribe(self._bot_cam_client)
+                except Exception: pass
+            if getattr(self, '_top_cam_client', None):
+                try: self._vid.unsubscribe(self._top_cam_client)
+                except Exception: pass
 
         try:
             self.motion.stopMove()
@@ -1501,7 +1521,7 @@ class BotFCBrain(object):
                     self.motion.stopMove()
                     with self.lock:
                         self.state = STATE_SEARCH
-                elif srv_cmd in (STATE_SEARCH, STATE_APPROACH, STATE_ALIGN, STATE_KICK):
+                elif srv_cmd in (STATE_SEARCH, STATE_APPROACH, STATE_ORBIT, STATE_ALIGN, STATE_KICK):
                     with self.lock:
                         self.state = srv_cmd
                 elif srv_cmd == "KICK_NOW":
@@ -1674,6 +1694,7 @@ class BotFCBrain(object):
                 prev_state = s
                 if   s == STATE_SEARCH:    self._do_search()
                 elif s == STATE_APPROACH:  self._do_approach()
+                elif s == STATE_ORBIT:     self._do_orbit()
                 elif s == STATE_ALIGN:     self._do_align()
                 elif s == STATE_KICK:      self._do_kick()
                 elif s == STATE_TACKLE:    self._do_tackle()
@@ -1692,92 +1713,106 @@ class BotFCBrain(object):
     # ─── Ball perception helpers ─────────────
 
     def _read_ball(self):
-        """Return (bx, by, bsz) from ALRedBallDetection if the timestamp is NEW.
-
-        NAOqi never clears redBallDetected when the ball leaves view — it just
-        stops advancing the timestamp.  Comparing consecutive timestamps is the
-        only reliable way to distinguish a live detection from stale cache.
-        """
-        try:
-            data = self.memory.getData("redBallDetected")
-            if not (data and len(data) >= 2):
-                return None
-            ts = (int(data[0][0]), int(data[0][1]))
-            if ts == self._last_ball_ts:
-                return None             # unchanged timestamp → stale
-            self._last_ball_ts = ts     # new timestamp → live detection
-            info = data[1]
-            return (float(info[0]), float(info[1]), float(info[2]))
-        except Exception:
-            return None
+        """Top camera ball detection using robust OpenCV circularity."""
+        return self._detect_cam_opencv(self._top_cam_client, TOP_CAM_HFOV, TOP_CAM_VFOV, min_px=RED_MIN_PX)
 
     def _read_ball_raw(self):
-        """Return (bx, by, bsz) from ALRedBallDetection WITHOUT the stale
-        timestamp guard.  Used for verification when we JUST saw the ball
-        and want to confirm it's still there (timestamps may not have
-        advanced yet within the same 33ms frame).
-
-        The data might be from the same frame, but that's fine for confirm.
-        """
-        try:
-            data = self.memory.getData("redBallDetected")
-            if not (data and len(data) >= 2):
-                return None
-            info = data[1]
-            bx  = float(info[0])
-            by  = float(info[1])
-            bsz = float(info[2])
-            # Sanity check: ball size must be positive and position reasonable.
-            if bsz <= 0.0 or abs(bx) > 1.0 or abs(by) > 1.0:
-                return None
-            return (bx, by, bsz)
-        except Exception:
-            return None
+        """Same as above, without cache delay. Redundant, kept for API compat."""
+        return self._detect_cam_opencv(self._top_cam_client, TOP_CAM_HFOV, TOP_CAM_VFOV, min_px=RED_MIN_PX)
 
     def _detect_bottom_cam(self):
-        """Detect red ball in the bottom camera using BGR thresholding.
+        """Bottom camera ball detection."""
+        return self._detect_cam_opencv(self._bot_cam_client, BOT_CAM_HFOV, BOT_CAM_VFOV, min_px=20)
 
-        Sampling every BOT_CAM_STRIDE pixels keeps CPU usage low on the NAO's
-        ARM core while still giving a reliable centroid for close-range use.
-        Returns (bx, by, bsz) normalised to the same convention as _read_ball(),
-        or None if no blob found.
+    def _detect_cam_opencv(self, client_id, hfov_rad, vfov_rad, min_px=20):
+        """Detect red ball in the given camera using OpenCV for robust circularity validation.
+
+        This uses finding contours and calculating circularity (4*pi*Area/Perimeter^2)
+        to prevent false positives from irregular shapes like shoes or wires.
+        Converts the raw image fractions to angle radians for the agent math.
         """
-        if not (self._vid and self._bot_cam_client):
+        if not (self._vid and client_id):
             return None
         try:
-            img = self._vid.getImageRemote(self._bot_cam_client)
+            img = self._vid.getImageRemote(client_id)
             if not img or len(img) < 7:
                 return None
             width  = int(img[0])
             height = int(img[1])
             pixels = bytearray(img[6])
 
-            bx_sum = by_sum = count = 0
-            stride = BOT_CAM_STRIDE * 3   # bytes to skip per sampled pixel
+            # Use OpenCV to process the image frame
+            import numpy as np
+            import cv2
+            
+            # Reconstruct image from byte array (NAOqi sends as BGR)
+            frame = np.frombuffer(pixels, dtype=np.uint8).reshape((height, width, 3))
+            
+            # Convert to HSV to better isolate red, which wraps around the hue channel
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            
+            # Red color range 1
+            lower_red1 = np.array([0, 120, 70])
+            upper_red1 = np.array([10, 255, 255])
+            mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
 
-            for off in range(0, len(pixels) - 2, stride):
-                b = pixels[off]
-                g = pixels[off + 1]
-                r = pixels[off + 2]
-                if (r > RED_R_MIN and b < RED_B_MAX and g < RED_G_MAX
-                        and r - max(b, g) > RED_DIFF_MIN):
-                    px = (off // 3) % width
-                    py = (off // 3) // width
-                    bx_sum += px
-                    by_sum += py
-                    count  += 1
+            # Red color range 2
+            lower_red2 = np.array([170, 120, 70])
+            upper_red2 = np.array([180, 255, 255])
+            mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+            
+            # Combine masks
+            mask = mask1 + mask2
+            
+            # Find contours
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            best_blob = None
+            max_area = 0
+            
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < min_px:
+                    continue
+                    
+                perimeter = cv2.arcLength(cnt, True)
+                if perimeter == 0:
+                    continue
+                    
+                # Circularity: 4 * pi * (Area / Perimeter^2)
+                # Perfect circle = 1.0. Square ~ 0.78. 
+                circularity = 4 * np.pi * (area / (perimeter * perimeter))
+                
+                # Check validation: Must be roughly a circle > 0.6
+                if circularity > 0.6 and area > max_area:
+                    max_area = area
+                    best_blob = cnt
+                    
+            self._vid.releaseImage(client_id)
 
-            self._vid.releaseImage(self._bot_cam_client)
-
-            if count < RED_MIN_PX:
+            if best_blob is None:
                 return None
 
-            # Normalise: centre of frame = 0, half-width = ±0.5
-            cx = (float(bx_sum) / count - width  * 0.5) / width
-            cy = (float(by_sum) / count - height * 0.5) / height
-            sz = float(count) / (width * height)
+            # Get image moments for centroid
+            M = cv2.moments(best_blob)
+            if M["m00"] == 0:
+                return None
+                
+            cx_px = int(M["m10"] / M["m00"])
+            cy_px = int(M["m01"] / M["m00"])
+
+            # Normalise: centre of frame = 0, positive = LEFT
+            frac_x = -(float(cx_px) - width  * 0.5) / width
+            frac_y = (float(cy_px) - height * 0.5) / height
+            
+            # **CRITICAL**: Convert fractions to angles in radians according to camera HFOV
+            cx = frac_x * hfov_rad
+            cy = frac_y * vfov_rad
+            
+            sz = float(max_area) / (width * height)
+            
             return (cx, cy, sz)
-        except Exception:
+        except Exception as e:
             return None
 
     def _detect_goal_posts(self):
@@ -1867,8 +1902,8 @@ class BotFCBrain(object):
             # Centroid x, normalised to [-0.5, 0.5]
             goal_cx = (float(best_bx_sum) / best_count - width * 0.5) / width
 
-            # NAO top camera HFOV ≈ 60.9° = 1.064 rad
-            cam_bearing = goal_cx * 1.064
+            # NAO bottom camera HFOV ≈ 47.64° = 0.831 rad
+            cam_bearing = goal_cx * BOT_CAM_HFOV
 
             head_yaw = 0.0
             try:
@@ -2179,42 +2214,76 @@ class BotFCBrain(object):
             return
             # Fall through removed: first fresh detection is trusted.
 
-        # ── Sweep with heading memory ──────────────────────────────────────
-        if (self.search_yaw == 0.0 and self.search_yaw_dir == 1.0
-                and self.ball_model.last_heading != 0.0):
-            seeded = max(-1.0, min(1.0, self.ball_model.last_heading))
-            self.search_yaw = seeded
+        # ── Dead Reckoning & Sweep with heading memory ──────────────────────
+        with self.lock:
+            ltime = self.last_ball_time
+            
+        search_duration = time.time() - ltime
+
+        # If entering search freshly, seed the yaw with last heading
+        if getattr(self, '_search_sweeps_reset_time', 0) < ltime:
+            self._search_sweeps_reset_time = time.time()
+            self.search_sweeps = 0
+            if self.ball_model.last_heading != 0.0:
+                self.search_yaw = max(-1.0, min(1.0, self.ball_model.last_heading))
+                self.search_yaw_dir = -1.0 if self.search_yaw > 0 else 1.0
+
+        # Phase 1: Dead Reckoning (Look Left/Right locally for 2s)
+        if search_duration < 2.0:
+            # Stand still, just pan the head
+            self.motion.stopMove()
+            
+            # Oscillate head quickly around last known position
+            center = max(-0.8, min(0.8, self.ball_model.last_heading))
+            oscillation = math.sin((search_duration / 2.0) * math.pi * 4) * 0.5
+            look_yaw = center + oscillation
+            look_yaw = max(-1.0, min(1.0, look_yaw))
+            
+            self.motion.setAngles("HeadPitch", 0.4, 0.25)
+            self.motion.setAngles("HeadYaw", look_yaw, 0.4)
+            return
+
+        # Phase 2: Start Body Searching & Memory Bounds
+        # Narrow search window if we just lost the ball, expanding after 4 seconds
+        if search_duration < 4.0 and self.ball_model.last_heading != 0.0:
+            center = max(-0.6, min(0.6, self.ball_model.last_heading))
+            sweep_limit_high = min(1.0, center + 0.5)
+            sweep_limit_low  = max(-1.0, center - 0.5)
+        else:
+            sweep_limit_low = -1.5
+            sweep_limit_high = 1.50
 
         self.search_yaw += self.search_yaw_dir * SEARCH_HEAD_SPEED
-        if self.search_yaw >= 1.0:
-            self.search_yaw     = 1.0
+        if self.search_yaw >= sweep_limit_high:
+            self.search_yaw     = sweep_limit_high
             self.search_yaw_dir = -1.0
-            self.search_sweeps  = getattr(self, 'search_sweeps', 0) + 1
-        elif self.search_yaw <= -1.0:
-            self.search_yaw     = -1.0
+            self.search_sweeps += 1
+        elif self.search_yaw <= sweep_limit_low:
+            self.search_yaw     = sweep_limit_low
             self.search_yaw_dir = 1.0
-            self.search_sweeps  = getattr(self, 'search_sweeps', 0) + 1
+            self.search_sweeps += 1
 
-        self.motion.setAngles("HeadYaw", self.search_yaw, 0.18)
+        # Move head slightly faster during search to cover ground quicker
+        self.motion.setAngles("HeadYaw", self.search_yaw, 0.25)
 
         # Alternate pitch: look down at ground nearby, then further out.
-        # This covers both close ball and far ball in the sweep.
-        sweeps = getattr(self, 'search_sweeps', 0)
+        sweeps = self.search_sweeps
         if sweeps % 2 == 0:
             self.motion.setAngles("HeadPitch", SEARCH_PITCH_LOW, 0.15)
         else:
             self.motion.setAngles("HeadPitch", SEARCH_PITCH_HIGH, 0.15)
 
         # ── Body movement while searching ──────────────────────────────────
-        with self.lock:
-            ltime = self.last_ball_time
-        search_duration = time.time() - ltime
-
         if search_duration > SEARCH_WALK_DELAY:
-            # Walk forward slowly while rotating to cover ground.
-            # Alternate rotation direction every 2 sweeps.
-            rot_dir = 0.25 if (sweeps // 2) % 2 == 0 else -0.25
-            self._stable_walk(0.3, 0.0, rot_dir)
+            # Energy efficiency: Do not walk forward blindly. 
+            # First, simply turn in place towards the last known ball direction.
+            # Rotating in place uses significantly less battery and doesn't get us out of position.
+            if search_duration < SEARCH_WALK_DELAY + 10.0:
+                rot_dir = 0.3 if self.ball_model.last_heading > 0 else -0.3
+                self._stable_walk(0.0, 0.0, rot_dir)
+            else:
+                # Only creep forward slowly if a full spin yielded nothing
+                self._stable_walk(0.15, 0.0, 0.2 if sweeps % 4 < 2 else -0.2)
         else:
             # First few seconds: stand still and just scan with head.
             self.motion.stopMove()
@@ -2268,10 +2337,9 @@ class BotFCBrain(object):
         dist = self.ball_model.dist
 
         # ── Head tracking: LOCK ON to the ball ─────────────────────────
-        # NAO convention: bx positive = ball right of camera center.
+        # NAO convention: bx positive = ball LEFT of camera center.
         # HeadYaw positive = head turned LEFT.
-        # To look at ball on the RIGHT, HeadYaw must go NEGATIVE.
-        # So: desired_head_yaw = current_yaw - bx * gain
+        # So: desired_head_yaw = current_yaw + track_bx * gain
         head_yaw = 0.0
         try:
             head_yaw = self.motion.getAngles("HeadYaw", False)[0]
@@ -2285,10 +2353,10 @@ class BotFCBrain(object):
 
         # Direct head servo: move head toward the ball.
         # Larger gain = more aggressive tracking = ball stays in view.
-        yaw_error = -track_bx * HEAD_TRACK_GAIN  # negative bx→positive yaw
+        yaw_error = track_bx * HEAD_TRACK_GAIN  # positive bx (left) -> positive yaw
         new_head_yaw = head_yaw + yaw_error
         new_head_yaw = max(-0.8, min(0.8, new_head_yaw))
-        self.motion.setAngles("HeadYaw", new_head_yaw, 0.35)
+        self.motion.setAngles("HeadYaw", new_head_yaw, 0.6)
 
         # Pitch: ALWAYS look down. Ball is on the ground.
         # Positive HeadPitch = looking DOWN on NAO.
@@ -2317,29 +2385,161 @@ class BotFCBrain(object):
             return
 
         # ── State transitions ──────────────────────────────────────────
-        if bsz >= KICK_BSZ_READY:
+        # Switch to ORBIT instead of ALIGN when getting close (bsz ~0.5m away)
+        if bsz >= KICK_BSZ_READY * 0.5:
             self.motion.stopMove()
-            self.motion.setAngles("HeadYaw", 0.0, 0.3)
+            with self.lock:
+                self.state = STATE_ORBIT
+            return
+
+        # ── Body movement: P-Controller & Look-Then-Walk ───
+        # The ball's world-relative bearing is approximately:
+        #   ball_bearing ≈ head_yaw + bx  (positive = ball to the left)
+        ball_bearing = head_yaw + track_bx
+        
+        # P-Controller for Body Turn Velocity (Theta)
+        # Apply strict proportional control relative to rotational error
+        Kp_turn = 1.0
+        body_turn = max(-0.6, min(0.6, ball_bearing * Kp_turn))
+        
+        # Look-Then-Walk paradigm:
+        # Prevent straight forward walking if the head hasn't fully centered the ball.
+        # This keeps the robot planted until the visual angle error reaches < 0.25 rad.
+        # Widen the deadband from 0.1 to 0.25 so it doesn't stutter-step.
+        if abs(head_yaw) > 0.25:
+            speed = 0.0  # Stand still and continue rotating (P-Controller doing the work)
+        else:
+            # When aligned, limit turn adjustments so it actually walks in a straight line
+            # instead of constantly curving and slowing down.
+            body_turn = max(-0.2, min(0.2, ball_bearing * 0.5))
+            
+            # Advancing to ball: increase speed multiplier so it doesn't walk too slow
+            speed = max(0.40,  # Minimum walk speed (was too slow before)
+                        min(APPROACH_MAX_SPEED, (dist - KICK_APPROACH_DIST) * 1.5))
+
+        self._stable_walk(speed, 0.0, body_turn)
+
+        self._stable_walk(speed, 0.0, body_turn)
+
+    # ─── ORBIT_TO_POSITION ───────────────────
+    def _do_orbit(self):
+        """Orbital Pathing / Get Behind Ball.
+        
+        Uses vector math to find an 'Approach Point' (P) exactly 0.3m behind the ball
+        (opposite the goal). Strafe/arc to this point before transitioning to ALIGN.
+        """
+        self._update_local_map()
+        self.leds.fadeRGB("AllLeds", 0x8A2BE2, 0.15)  # purple = orbit
+
+        now = time.time()
+        ball = self._detect_bottom_cam()
+        if ball is None:
+            ball = self._read_ball()
+            
+        if ball is not None:
+            bx, by, bsz = ball
+            try:
+                head_yaw = self.motion.getAngles("HeadYaw", False)[0]
+            except Exception:
+                head_yaw = 0.0
+            self.ball_model.update(bx, by, bsz, head_yaw)
+
+        if not self.ball_model.valid:
+            self.motion.stopMove()
+            with self.lock:
+                self.state = STATE_SEARCH
+            return
+
+        with self.lock:
+            self.last_ball_time = now
+
+        bx   = self.ball_model.bx
+        bsz  = self.ball_model.bsz
+        dist = self.ball_model.dist  # meters from robot to ball
+        
+        # Sonar check
+        sl = sr = 9.0
+        try:
+            sl = float(self.memory.getData("Device/SubDeviceList/US/Left/Sensor/Value"))
+            sr = float(self.memory.getData("Device/SubDeviceList/US/Right/Sensor/Value"))
+        except Exception:
+            pass
+        if min(sl, sr) <= COMBAT_DISTANCE:
+            self.motion.stopMove()
+            with self.lock:
+                self.state = STATE_TACKLE
+            return
+
+        # Keep head locked on ball
+        head_yaw = 0.0
+        try:
+            head_yaw = self.motion.getAngles("HeadYaw", False)[0]
+        except Exception:
+            pass
+            
+        new_head_yaw = max(-0.8, min(0.8, head_yaw + bx * HEAD_TRACK_GAIN))
+        self.motion.setAngles("HeadYaw", new_head_yaw, 0.6)
+        
+        # Pitch down
+        if bsz > 0.10: pitch = 0.40 + min(0.12, (bsz - 0.10) * 3.0)
+        else: pitch = 0.35
+        self.motion.setAngles("HeadPitch", pitch, 0.25)
+
+        # ── Vector Math for Approach Point (P) ──────────────────────
+        goal_bearing = getattr(self, 'goal_bearing', DEFAULT_GOAL_BEARING)
+        robot_heading = 0.0
+        try:
+            p = self.motion.getRobotPosition(True)
+            robot_heading = p[2]
+        except Exception:
+            pass
+
+        yaw_to_goal = goal_bearing - robot_heading
+        while yaw_to_goal >  math.pi: yaw_to_goal -= 2.0 * math.pi
+        while yaw_to_goal < -math.pi: yaw_to_goal += 2.0 * math.pi
+        
+        yaw_to_ball = head_yaw + bx
+        
+        # Target Offset
+        OFFSET_DIST = 0.30  # meters behind ball
+        
+        # We need to reach a point P that is OFFSET_DIST behind the ball on the goal-ball line.
+        # In robot Cartesian space (x=forward, y=left):
+        # Ball pos:
+        ball_x = dist * math.cos(yaw_to_ball)
+        ball_y = dist * math.sin(yaw_to_ball)
+        
+        # Goal vector from ball (approximated conceptually by yaw_to_goal vs yaw_to_ball)
+        # Vector from ball TO robot TO goal... simpler: 
+        # The vector pointing from the ball to the goal is at angle `yaw_to_goal_from_ball`.
+        # For simplicity, we assume goal is very far, so `yaw_to_goal` is roughly the same everywhere locally.
+        # So we want to be at: Ball - (Goal Direction * OFFSET_DIST)
+        
+        target_x = ball_x - (OFFSET_DIST * math.cos(yaw_to_goal))
+        target_y = ball_y - (OFFSET_DIST * math.sin(yaw_to_goal))
+        
+        err_dist = math.hypot(target_x, target_y)
+        err_angle = math.atan2(target_y, target_x)
+        
+        # ── Move and Transition ──────────────────────
+        # "Close enough" threshold
+        if err_dist < 0.10: 
+            # We are at the orbital point, stop and align
+            self.motion.stopMove()
             with self.lock:
                 self.state = STATE_ALIGN
             return
 
-        # ── Body movement: turn body toward ball, then walk forward ───
-        # The ball's world-relative bearing is approximately:
-        #   ball_bearing ≈ head_yaw - bx  (negative = ball to the right)
-        # We want body to turn toward that bearing.
-        ball_bearing = new_head_yaw  # head is already pointing at ball
-        body_turn = max(-0.6, min(0.6, ball_bearing * APPROACH_TURN_GAIN))
-
-        # Speed: fast when far, slow and careful when close.
-        speed = max(APPROACH_MIN_SPEED,
-                    min(APPROACH_MAX_SPEED, (dist - KICK_APPROACH_DIST) * 0.8))
-
-        # If ball is far off to the side, slow down and turn first.
-        if abs(ball_bearing) > 0.25:
-            speed = min(speed, 0.15)
-
-        self._stable_walk(speed, 0.0, body_turn)
+        # Holonomic (strafe/Arc) drive
+        # We want to move towards target_x, target_y while keeping our head pointing at the ball
+        vx = max(-0.5, min(0.5, target_x * 2.0))
+        vy = max(-0.4, min(0.4, target_y * 1.5))
+        
+        # Add rotation to keep body facing ball slightly, or just rely on ALIGN for body
+        # Let's keep body facing ball for now
+        vtheta = max(-0.4, min(0.4, yaw_to_ball * 0.8))
+        
+        self._stable_walk(vx, vy, vtheta)
 
     # ─── ALIGN ──────────────────────────────
     def _do_align(self):
@@ -2419,8 +2619,10 @@ class BotFCBrain(object):
         ball_centered = abs(bx) < KICK_BX_MAX
         facing_goal   = abs(heading_error) < 0.25   # ~14 degrees tolerance
 
-        # ── Kick-ready transition ─────────────────────────────────────────
-        if ball_centered and bsz > KICK_BSZ_READY and facing_goal:
+        # ── Kick-ready transition (HACKATHON QUICK-TRIGGER) ───────────────────
+        # Don't wait to be perfectly aligned. If ball is close to feet (bsz is huge)
+        # and we are roughly facing the right way (goal error < 0.3 rad ~17 deg), kick!
+        if ball_centered and bsz > KICK_BSZ_READY * 0.90 and abs(heading_error) < 0.35:
             self.motion.stopMove()
             with self.lock:
                 self.state = STATE_KICK
@@ -2432,18 +2634,18 @@ class BotFCBrain(object):
 
         if abs(bx) > ALIGN_BODY_DEADBAND:
             # Ball off-center: shuffle laterally and rotate to center it.
-            lateral = -bx * 0.12    # gentle lateral shuffle
-            turn    = -bx * 0.70    # body rotation to re-centre ball
-            self._stable_walk(0.06, lateral, turn)
+            lateral = bx * 0.20    # aggressive lateral shuffle (positive is left)
+            turn    = bx * 0.70    # body rotation to re-centre ball (positive is left)
+            self._stable_walk(0.02, lateral, turn)
         elif not facing_goal and bsz >= KICK_BSZ_READY * 0.8:
             # Ball is centered but we're not facing the goal.
             # Circle-strafe: walk sideways around the ball to change our
             # heading without losing sight of it.
             strafe_dir = 1.0 if heading_error > 0 else -1.0
             self._stable_walk(0.0, strafe_dir * 0.08, heading_error * 0.4)
-        elif bsz < 0.12:
+        elif bsz < KICK_BSZ_READY * 0.90:
             # Well-centred but not close enough – creep forward.
-            self._stable_walk(0.10, 0.0, 0.0)
+            self._stable_walk(0.15, 0.0, 0.0)
         else:
             # Very close and centered – hold still.
             self.motion.stopMove()
