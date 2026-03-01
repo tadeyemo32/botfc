@@ -41,9 +41,13 @@ MOTOR_TEMP_LIMIT = 60.0
 # ─────────────────────────────────────────────
 # bsz when the ball is exactly 1 m away – calibrate on field!
 # Increase if your ball looks small at 1 m; decrease if too large.
-BALL_K_CONST   = 0.042
-BALL_EMA_ALPHA = 0.60    # weight on new measurement (0=frozen, 1=raw)
-BALL_LOSS_TIME = 1.8     # seconds before the model is marked invalid
+BALL_K_CONST      = 0.042
+BALL_EMA_ALPHA    = 0.60   # weight on new measurement (0=frozen, 1=raw)
+BALL_LOSS_TIME    = 1.8    # seconds before the model is marked invalid
+BALL_VEL_EMA      = 0.35   # velocity smoothing (lower = smoother but laggier)
+BALL_PRED_HORIZON = 0.45   # seconds ahead to predict ball position
+BALL_VEL_THRESH   = 0.18   # camera-space units/sec – "ball is moving fast"
+BALL_CONF_RAMP    = 1.5    # seconds of continuous tracking to reach full confidence
 
 # ─────────────────────────────────────────────
 # Head-tracking / approach constants
@@ -109,60 +113,104 @@ STATE_HALFTIME = "HALFTIME"
 # BallModel – EMA smoother + distance + heading
 # ─────────────────────────────────────────────
 class BallModel(object):
-    """Exponential-moving-average ball tracker.
+    """Ball tracker with EMA smoothing, velocity estimation, and prediction.
 
-    Maintains a smoothed estimate of ball position in camera space and
-    estimates distance from apparent size.  Remembers the last known
-    heading so the search state can begin facing the right direction
-    instead of doing a blind full-circle sweep every time.
+    Position is smoothed with an EMA filter.  Velocity is estimated from
+    consecutive position deltas (also EMA-smoothed) and used to predict
+    where the ball will be BALL_PRED_HORIZON seconds ahead so the robot
+    can intercept a moving ball rather than chasing its current position.
 
-    Call tick() once per FSM cycle to expire stale readings.
+    confidence (0–1) ramps up over BALL_CONF_RAMP seconds of continuous
+    tracking.  The approach FSM only uses predictions when confidence is
+    high enough to trust the velocity estimate.
+
+    Call tick() once per FSM cycle to expire stale data.
     """
 
     def __init__(self):
         self._bx   = 0.0
         self._by   = 0.0
         self._bsz  = 0.0
-        self.dist  = 9.9    # estimated distance in metres
+        self.dist  = 9.9
         self.valid = False
-        self.last_seen    = 0.0
-        self.last_heading = 0.0   # head_yaw + bx at last confirmed sighting
+        self.last_seen       = 0.0
+        self.last_heading    = 0.0
+        # Velocity & prediction
+        self._vbx            = 0.0   # camera-space horizontal velocity (units/s)
+        self._vby            = 0.0
+        self._last_update_t  = None
+        self._tracking_since = 0.0
+        self.pred_bx         = 0.0   # predicted position BALL_PRED_HORIZON s ahead
+        self.pred_by         = 0.0
+        self.confidence      = 0.0   # 0–1 tracker confidence
 
-    # Read-only smoothed values
+    # ── Read-only properties ──────────────────────────────────────────────
     @property
     def bx(self):  return self._bx
     @property
     def by(self):  return self._by
     @property
     def bsz(self): return self._bsz
+    @property
+    def vbx(self): return self._vbx
+    @property
+    def vby(self): return self._vby
 
     def update(self, raw_bx, raw_by, raw_bsz, head_yaw):
-        a = BALL_EMA_ALPHA
+        now = time.time()
+        a   = BALL_EMA_ALPHA
+
         if self.valid:
+            # ── Velocity estimation ─────────────────────────────────────
+            if self._last_update_t is not None:
+                dt = now - self._last_update_t
+                if 0.01 < dt < 0.5:
+                    raw_vbx = max(-4.0, min(4.0, (raw_bx - self._bx) / dt))
+                    raw_vby = max(-4.0, min(4.0, (raw_by - self._by) / dt))
+                    v = BALL_VEL_EMA
+                    self._vbx = v * raw_vbx + (1.0 - v) * self._vbx
+                    self._vby = v * raw_vby + (1.0 - v) * self._vby
+            # ── Position EMA ─────────────────────────────────────────────
             self._bx  = a * raw_bx  + (1.0 - a) * self._bx
             self._by  = a * raw_by  + (1.0 - a) * self._by
             self._bsz = a * raw_bsz + (1.0 - a) * self._bsz
         else:
+            # First detection after a gap – seed position, zero velocity
             self._bx, self._by, self._bsz = raw_bx, raw_by, raw_bsz
+            self._vbx = 0.0
+            self._vby = 0.0
+            self._tracking_since = now
+
         self.dist = max(0.1, BALL_K_CONST / max(self._bsz, 0.001))
-        # last_heading is the robot-relative angle at which the ball lies.
-        # head_yaw > 0 means head is turned left; adding bx (positive = right
-        # of frame) gives the approximate bearing relative to the robot body.
         self.last_heading = head_yaw + self._bx
-        self.valid = True
-        self.last_seen = time.time()
+        self.valid        = True
+        self.last_seen    = now
+        self._last_update_t = now
+
+        # ── Prediction ───────────────────────────────────────────────────
+        h = BALL_PRED_HORIZON
+        self.pred_bx = max(-0.5, min(0.5, self._bx + self._vbx * h))
+        self.pred_by = max(-0.5, min(0.5, self._by + self._vby * h))
+
+        # ── Confidence (ramps from 0→1 over BALL_CONF_RAMP seconds) ──────
+        elapsed = now - self._tracking_since
+        self.confidence = min(1.0, elapsed / BALL_CONF_RAMP)
 
     def age(self):
         return (time.time() - self.last_seen) if self.valid else -1.0
 
     def tick(self):
-        """Mark the model invalid when no detection has arrived for too long."""
+        """Expire stale model; reset velocity when the ball is lost."""
         if self.valid and self.age() > BALL_LOSS_TIME:
-            self.valid = False
+            self.valid      = False
+            self._vbx       = 0.0
+            self._vby       = 0.0
+            self.confidence = 0.0
+            self._tracking_since = 0.0
 
 
 # ─────────────────────────────────────────────
-# TelemetryClient  (unchanged from original)
+# TelemetryClient
 # ─────────────────────────────────────────────
 class TelemetryClient(object):
     def __init__(self, host, port):
@@ -173,10 +221,20 @@ class TelemetryClient(object):
         self.thread = None
         self.lock = threading.Lock()
         self.current_data = {
-            "state": STATE_INIT,
-            "kicks": 0,
-            "ball_age": -1.0,
-            "break_remaining": 0,
+            # FSM
+            "state": STATE_INIT, "kicks": 0,
+            "ball_age": -1.0,    "break_remaining": 0,
+            # Battery
+            "battery_pct": -1,
+            # Ball state
+            "ball_valid": False, "ball_bx": 0.0,  "ball_by": 0.0,
+            "ball_bsz": 0.0,     "ball_dist": 9.9,
+            "ball_vx": 0.0,      "ball_vy": 0.0,
+            "ball_pred_bx": 0.0, "ball_pred_by": 0.0,
+            "ball_confidence": 0.0,
+            # Robot pose
+            "head_yaw": 0.0,
+            "inertial_roll": 0.0, "inertial_pitch": 0.0,
         }
 
     def start(self, trait):
@@ -193,15 +251,10 @@ class TelemetryClient(object):
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=3)
 
-    def update(self, state, kicks, ball_age, break_remaining, battery_pct=-1):
+    def update(self, **kw):
+        """Merge keyword arguments into the live telemetry dict."""
         with self.lock:
-            self.current_data = {
-                "state": state,
-                "kicks": kicks,
-                "ball_age": ball_age,
-                "break_remaining": break_remaining,
-                "battery_pct": battery_pct,
-            }
+            self.current_data.update(kw)
 
     def _build_payload(self):
         with self.lock:
@@ -342,9 +395,59 @@ class MLDataLogger(object):
             except Exception:
                 pass
 
+    # CSV columns for ML training
+    CSV_HEADER = (
+        "timestamp,state,ball_valid,ball_bx,ball_by,ball_bsz,ball_dist,"
+        "ball_vx,ball_vy,ball_pred_bx,ball_pred_by,ball_confidence,"
+        "head_yaw,inertial_roll,inertial_pitch,kicks,battery_pct\n"
+    )
+
     def update_telemetry(self, snapshot):
         with self.lock:
             self.current_telemetry = snapshot.copy()
+
+    def _ensure_csv_header(self):
+        csv_path = self.out_dir + "game_log.csv"
+        try:
+            import os as _os
+            if not _os.path.exists(csv_path):
+                with open(csv_path, "w") as f:
+                    f.write(MLDataLogger.CSV_HEADER)
+        except Exception:
+            pass
+        return csv_path
+
+    def log_game_state(self, t):
+        """Append one structured row to the game_log CSV for ML training.
+
+        t must be a dict from TelemetryClient.current_data (already includes
+        ball_bx, ball_vx, etc.).  Called from BotFCBrain._run() each cycle.
+        """
+        try:
+            csv_path = self.out_dir + "game_log.csv"
+            row = "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(
+                time.time(),
+                t.get("state",            "UNKNOWN"),
+                1 if t.get("ball_valid")  else 0,
+                t.get("ball_bx",          0.0),
+                t.get("ball_by",          0.0),
+                t.get("ball_bsz",         0.0),
+                t.get("ball_dist",        9.9),
+                t.get("ball_vx",          0.0),
+                t.get("ball_vy",          0.0),
+                t.get("ball_pred_bx",     0.0),
+                t.get("ball_pred_by",     0.0),
+                t.get("ball_confidence",  0.0),
+                t.get("head_yaw",         0.0),
+                t.get("inertial_roll",    0.0),
+                t.get("inertial_pitch",   0.0),
+                t.get("kicks",            0),
+                t.get("battery_pct",      -1),
+            )
+            with open(csv_path, "a") as f:
+                f.write(row)
+        except Exception:
+            pass
 
     def _save_json(self, path, t):
         try:
@@ -354,6 +457,7 @@ class MLDataLogger(object):
             pass
 
     def _loop(self):
+        self._ensure_csv_header()
         while self.running:
             try:
                 img_data = self.video_device.getImageRemote(self.video_client_name)
@@ -712,7 +816,7 @@ class BotFCBrain(object):
         except Exception:
             pass
 
-        self.last_ball_time = time.time() - 100.0
+        self.last_ball_time = time.time()  # start grace period from NOW, not -100s
 
         with self.lock:
             self.state = STATE_SEARCH
@@ -838,13 +942,49 @@ class BotFCBrain(object):
                 lbt= self.last_ball_time
 
             ball_age = self.ball_model.age()
+
+            # Battery
             bat = -1
             try:
                 if self.battery:
                     bat = int(self.battery.getBatteryCharge())
             except Exception:
                 pass
-            self.telemetry_client.update(s, k, ball_age, br, bat)
+
+            # Head yaw & inertial sensors for telemetry
+            h_yaw = 0.0
+            try:
+                h_yaw = self.motion.getAngles("HeadYaw", False)[0]
+            except Exception:
+                pass
+            roll, pitch = self._read_inertial()
+
+            bm = self.ball_model
+            self.telemetry_client.update(
+                state=s, kicks=k,
+                ball_age=round(ball_age, 2),
+                break_remaining=br,
+                battery_pct=bat,
+                # Ball state
+                ball_valid=bm.valid,
+                ball_bx=round(bm.bx,  3), ball_by=round(bm.by,  3),
+                ball_bsz=round(bm.bsz, 4),
+                ball_dist=round(bm.dist, 2),
+                ball_vx=round(bm.vbx, 3),  ball_vy=round(bm.vby, 3),
+                ball_pred_bx=round(bm.pred_bx, 3),
+                ball_pred_by=round(bm.pred_by, 3),
+                ball_confidence=round(bm.confidence, 2),
+                # Robot pose
+                head_yaw=round(h_yaw, 3),
+                inertial_roll=round(roll,  3),
+                inertial_pitch=round(pitch, 3),
+            )
+
+            # Log game state for ML training (every cycle = ~20 Hz)
+            with self.telemetry_client.lock:
+                telem_snap = self.telemetry_client.current_data.copy()
+            self.data_logger.update_telemetry(telem_snap)
+            self.data_logger.log_game_state(telem_snap)
 
             if s != STATE_HALFTIME:
                 self._enforce_bounds()
@@ -1153,16 +1293,20 @@ class BotFCBrain(object):
         bsz = self.ball_model.bsz
         dist = self.ball_model.dist
 
-        # ── Head tracking ──────────────────────────────────────────────────
-        # Servo the head to chase bx so the head encoder always reflects the
-        # true ball direction.  We then drive the body from head_yaw (joint
-        # encoder, zero lag) rather than from bx (camera, up to 100 ms lag).
+        # ── Head tracking with ball-movement prediction ─────────────────────
+        # When confidence is high and the ball is moving fast, servo the head
+        # toward the PREDICTED position (BALL_PRED_HORIZON s ahead) instead of
+        # the current position.  This keeps the ball in frame even when it is
+        # rolling across the camera FOV.  At low confidence (just found ball)
+        # track the measured position to avoid overshooting.
         head_yaw = 0.0
         try:
             head_yaw = self.motion.getAngles("HeadYaw", False)[0]
-            # NAO: positive HeadYaw = head left.  bx > 0 = ball right of frame
-            # → decrease yaw to track right.
-            target_yaw = max(-1.0, min(1.0, head_yaw - bx * HEAD_TRACK_GAIN))
+            ball_moving = abs(self.ball_model.vbx) > BALL_VEL_THRESH
+            use_pred    = ball_moving and self.ball_model.confidence > 0.5
+            track_bx    = self.ball_model.pred_bx if use_pred else bx
+            # NAO: positive HeadYaw = head left. bx > 0 = ball right of frame.
+            target_yaw = max(-1.0, min(1.0, head_yaw - track_bx * HEAD_TRACK_GAIN))
             self.motion.setAngles("HeadYaw", target_yaw, 0.4)
             head_yaw = target_yaw
         except Exception:
