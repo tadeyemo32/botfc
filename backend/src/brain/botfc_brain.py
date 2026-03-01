@@ -549,6 +549,106 @@ class BotFCBrain(object):
             "Device/SubDeviceList/RKneePitch/Temperature/Sensor/Value",
         ]
 
+    # ─── Posture / fall helpers ──────────────
+    def _read_inertial(self):
+        """Return (roll_rad, pitch_rad) from the inertial sensor unit.
+
+        AngleX ≈ roll (lean left/right), AngleY ≈ pitch (lean forward/back).
+        Returns (0, 0) if the sensor is unavailable.
+        """
+        try:
+            roll  = float(self.memory.getData(
+                "Device/SubDeviceList/InertialSensor/AngleX/Sensor/Value"))
+            pitch = float(self.memory.getData(
+                "Device/SubDeviceList/InertialSensor/AngleY/Sensor/Value"))
+            return (roll, pitch)
+        except Exception:
+            return (0.0, 0.0)
+
+    def _is_fallen(self):
+        """Return True if the inertial sensor shows the robot is no longer upright.
+
+        Thresholds (radians):
+          |roll|  > 0.55 rad (~31°) → sideways fall
+          |pitch| > 0.80 rad (~46°) → forward/backward fall
+        These are conservative: even a strong lean will trigger recovery before
+        the robot has fully toppled.
+        """
+        roll, pitch = self._read_inertial()
+        return abs(roll) > 0.55 or abs(pitch) > 0.80
+
+    def _ensure_standing(self, max_attempts=3):
+        """Bring the robot to StandInit from any starting posture.
+
+        Strategy
+        --------
+        1. Enable full stiffness first (robot may be limp after a fall or
+           a previous session's crouch-and-release).
+        2. Check inertial sensors.  If already upright (|roll|<0.30 and
+           |pitch|<0.30) just confirm with a gentle StandInit call.
+        3. If tilted / on the ground: announce, then call
+           goToPosture("StandInit", speed=0.3) – slow is safe.
+           NAOqi's posture manager knows the correct get-up motion for each
+           face-down / face-up starting configuration.
+        4. Wait up to 5 s per attempt, re-check inertial sensors.
+        5. Retry up to max_attempts times.
+
+        Returns True when the robot is confirmed upright, False if all
+        attempts fail (the FSM will stay in INIT and not drive the motors).
+        """
+        UPRIGHT_ROLL  = 0.30   # rad – threshold for "close enough to vertical"
+        UPRIGHT_PITCH = 0.30
+        GET_UP_SPEED  = 0.30   # slow: safer when coming from the floor
+        SETTLE_TIME   = 5.0    # seconds to wait per attempt
+
+        for attempt in range(1, max_attempts + 1):
+            # Always ensure stiffness before trying to move
+            try:
+                self.motion.setStiffnesses("Body", 1.0)
+            except Exception:
+                pass
+
+            roll, pitch = self._read_inertial()
+            upright = abs(roll) < UPRIGHT_ROLL and abs(pitch) < UPRIGHT_PITCH
+
+            if upright and attempt == 1:
+                # Robot is already upright – just confirm with StandInit
+                print("[BotFC] Posture: upright (roll={:.2f} pitch={:.2f}). "
+                      "Calling StandInit.".format(roll, pitch))
+                try:
+                    self.posture.goToPosture("StandInit", 0.5)
+                except Exception:
+                    pass
+                return True
+
+            print("[BotFC] Posture attempt {}/{}: roll={:.2f} pitch={:.2f} – "
+                  "robot not upright. Attempting get-up...".format(
+                      attempt, max_attempts, roll, pitch))
+            try:
+                self.tts.post.say("Stand by, getting up.")
+            except Exception:
+                pass
+
+            try:
+                self.posture.goToPosture("StandInit", GET_UP_SPEED)
+            except Exception as e:
+                print("[BotFC] goToPosture error: {}".format(e))
+
+            # Wait for the motion to complete and the robot to settle
+            time.sleep(SETTLE_TIME)
+
+            roll, pitch = self._read_inertial()
+            if abs(roll) < UPRIGHT_ROLL and abs(pitch) < UPRIGHT_PITCH:
+                print("[BotFC] Get-up succeeded on attempt {}.".format(attempt))
+                return True
+
+            print("[BotFC] Still not upright after attempt {}.".format(attempt))
+            time.sleep(1.0)
+
+        print("[BotFC] WARN: Could not confirm upright after {} attempts. "
+              "Proceeding anyway.".format(max_attempts))
+        return False
+
     # ─── Startup / shutdown ──────────────────
     def start(self):
         if self.running:
@@ -571,8 +671,13 @@ class BotFCBrain(object):
         except Exception as e:
             print("[BotFC] ALBattery unavailable: {}".format(e))
 
+        # ── Step 1: get the robot upright BEFORE anything else ────────────
+        # This must happen before subscribing cameras or starting the FSM so
+        # that no motion command fires while the robot is still on the floor.
         self.motion.setStiffnesses("Body", 1.0)
+        self._ensure_standing()
 
+        # ── Step 2: now it's safe to subscribe sensors / cameras ──────────
         # Disable collision protection so the robot can close in on the ball
         # without auto-shuffling away from "obstacles" (its own arms/opponent).
         try:
@@ -599,7 +704,6 @@ class BotFCBrain(object):
         except Exception as e:
             print("[BotFC] Bottom camera unavailable: {}".format(e))
 
-        self.posture.goToPosture("StandInit", 1.0)
         self.tts.post.say("Brain online. Let's play football.")
 
         try:
@@ -699,10 +803,27 @@ class BotFCBrain(object):
                 while self.running and self._check_kill_switch():
                     time.sleep(0.2)
                 if self.running:
-                    self.motion.setStiffnesses("Body", 1.0)
-                    self.posture.goToPosture("StandInit", 1.0)
+                    self._ensure_standing()
                     with self.lock:
                         self.state = STATE_SEARCH
+                continue
+
+            # ── Fall recovery (mid-match) ──────────────────────────────────
+            if self._is_fallen():
+                self.motion.stopMove()
+                self.ball_model.valid = False   # invalidate stale ball data
+                try:
+                    self.leds.fadeRGB("AllLeds", 0xFF6600, 0.1)
+                except Exception:
+                    pass
+                print("[BotFC] Fall detected – attempting recovery.")
+                self._ensure_standing(max_attempts=3)
+                try:
+                    self.leds.fadeRGB("AllLeds", 0x00FF00, 0.2)
+                except Exception:
+                    pass
+                with self.lock:
+                    self.state = STATE_SEARCH
                 continue
 
             self._safety_check()
