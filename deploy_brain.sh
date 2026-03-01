@@ -60,6 +60,11 @@ echo "[i] Stopping any existing brain on robot..."
 sshpass -p "$ROBOT_PASS" ssh -o StrictHostKeyChecking=no "$ROBOT_USER@$ROBOT_IP" \
     "pkill -f botfc_brain.py 2>/dev/null || true"
 
+# 1.5 Clear old logs
+echo "[i] Clearing old logs..."
+sshpass -p "$ROBOT_PASS" ssh -o StrictHostKeyChecking=no "$ROBOT_USER@$ROBOT_IP" \
+    "echo '' > /home/nao/botfc_brain.log"
+
 # 2. Copy brain to robot
 echo "[i] Deploying botfc_brain.py to $ROBOT_USER@$ROBOT_IP:/home/nao/..."
 sshpass -p "$ROBOT_PASS" scp -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
@@ -75,13 +80,14 @@ echo "[i] Starting Python brain on robot..."
 echo "    Command: python /home/nao/botfc_brain.py --ip=$ROBOT_IP --pport=$ROBOT_PORT --trait=$TRAIT --server-ip=$SERVER_IP --server-port=$SERVER_PORT"
 
 sshpass -p "$ROBOT_PASS" ssh -o StrictHostKeyChecking=no "$ROBOT_USER@$ROBOT_IP" \
-    "nohup python /home/nao/botfc_brain.py \
+    "export PYTHONPATH=/opt/aldebaran/lib/python2.7/site-packages && \
+     nohup python /home/nao/botfc_brain.py \
         --ip=127.0.0.1 \
         --pport=$ROBOT_PORT \
         --trait=$TRAIT \
         --server-ip=$SERVER_IP \
         --server-port=$SERVER_PORT \
-        > /home/nao/botfc_brain.log 2>&1 &"
+        </dev/null >/home/nao/botfc_brain.log 2>&1 &"
 
 echo ""
 echo "================================================="

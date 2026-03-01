@@ -45,30 +45,8 @@ else()
 endif()
 
 # -------------------------------------------------------------
-# BotFC Robot Brain (NAOqi Cross-compiled Executable)
+# BotFC Robot Brain (Python only now)
 # -------------------------------------------------------------
-find_package(qibuild QUIET)
-
-if(QIBUILD_FOUND)
-    include_directories(include/brain include/core)
-    qi_create_bin(botfc_brain
-      src/brain/brain_main.cpp
-      include/brain/BotFCBrain.h
-      src/brain/BotFCBrain.cpp
-      include/brain/MLDataLogger.h
-      src/brain/MLDataLogger.cpp
-      include/brain/TelemetryClient.h
-      src/brain/TelemetryClient.cpp
-      include/brain/Roles.h
-      # Re-use config inside brain if needed: src/core/Config.cpp
-    )
-
-    qi_use_lib(botfc_brain
-      ALCOMMON
-      ALPROXIES
-      ALMEMORYFASTACCESS
-      ALVISION
-      QI
-      BOOST
-    )
-endif()
+# We previously had a C++ cross-compiled brain here, but we
+# have fully migrated to Python (botfc_brain.py) so there is 
+# no longer a requirement to invoke qibuild/qi_create_bin.
