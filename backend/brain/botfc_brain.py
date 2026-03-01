@@ -2314,20 +2314,38 @@ class BotFCBrain(object):
         except Exception:
             pass
 
-    def _track_head_to_ball(self):
-        """Unified method for smooth head tracking using a PD controller + ML predictions."""
+    def _track_head_to_ball(self, lock_forward=False):
+        """Unified method for smooth head tracking using a PD controller + ML predictions.
+        
+        Args:
+            lock_forward (bool): If True, gently drag the head back to center (yaw=0.0) 
+                                 and lock pitch pointing down. This forces the robot's BODY
+                                 to turn to keep the ball in sight, producing a true 'string path'.
+        """
         if not self.ball_model.valid:
             return
 
-        # Use prediction for tracking if confidence is high, else use raw EMA smoothed 'bx'
-        track_bx = self.ball_model.pred_bx if self.ball_model.confidence > 0.8 else self.ball_model.bx
-        
         # Current head position
         try:
             head_yaw = self.motion.getAngles("HeadYaw", False)[0]
             head_pitch = self.motion.getAngles("HeadPitch", False)[0]
         except Exception:
             return
+
+        if lock_forward:
+            # Decay head yaw smoothly back to 0.0 (straight forward)
+            # 20% reduction per tick prevents violent jerking that would lose the ball
+            new_head_yaw = head_yaw * 0.80
+            
+            # Lock pitch pointing steadily downwards
+            target_pitch = 0.35
+            
+            self.motion.setAngles(["HeadYaw", "HeadPitch"], [new_head_yaw, target_pitch], 0.25)
+            return
+
+        # ── NORMAL TRACKING MODE (Scanning) ──
+        # Use prediction for tracking if confidence is high, else use raw EMA smoothed 'bx'
+        track_bx = self.ball_model.pred_bx if self.ball_model.confidence > 0.8 else self.ball_model.bx
             
         # PD Controller for Yaw
         # Ensure we don't overshoot by factoring in current yaw velocity (d_bx)
@@ -2359,7 +2377,7 @@ class BotFCBrain(object):
         self.leds.fadeRGB("AllLeds", 0x00FF00, 0.15)
 
         # ── Head tracking ─────────────────────────────────────────────────
-        self._track_head_to_ball()
+        self._track_head_to_ball(lock_forward=True)
 
         # ── Sonar obstacle check ───────────────────────────────────────
         sl = sr = 9.0
@@ -2462,8 +2480,8 @@ class BotFCBrain(object):
                 self.state = STATE_TACKLE
             return
 
-        # Keep head locked on ball using unified tracking
-        self._track_head_to_ball()
+        # Keep head locked forward while moving (use body to track)
+        self._track_head_to_ball(lock_forward=True)
 
         # ── Vector Math for Approach Point (P) ──────────────────────
         goal_bearing = getattr(self, 'goal_bearing', DEFAULT_GOAL_BEARING)
@@ -2537,8 +2555,8 @@ class BotFCBrain(object):
         self._update_local_map()
         self.leds.fadeRGB("AllLeds", 0x4D9FFF, 0.15)   # blue = aligning
 
-        # Keep tracking ball smoothly through ALIGN phase
-        self._track_head_to_ball()
+        # Keep tracking ball smoothly but locked forward during ALIGN phase
+        self._track_head_to_ball(lock_forward=True)
 
         now = time.time()
 
