@@ -293,7 +293,7 @@ function TelemetryPanel({ showCamera = true }) {
 
       {/* C++ AI Decision */}
       <div style={{ padding: "8px 10px", background: `${cppSc}08`, border: `1px solid ${cppSc}25`, borderRadius: 4 }}>
-        <div style={{ fontSize: "0.45rem", color: "#3d6a50", letterSpacing: "0.15em", marginBottom: 4 }}>C++ LOCAL AI DECISION</div>
+        <div style={{ fontSize: "0.45rem", color: "#3d6a50", letterSpacing: "0.15em", marginBottom: 4 }}>LOCAL AI DECISION</div>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{ width: 8, height: 8, borderRadius: "50%", background: cppSc, boxShadow: `0 0 8px ${cppSc}` }} />
           <div style={{ fontSize: "0.9rem", fontWeight: 700, color: cppSc, letterSpacing: "0.1em" }}>{telem.cpp_action || "IDLE"}</div>
@@ -622,9 +622,9 @@ export default function App() {
           {/* Architecture note */}
           <div style={{ marginTop: "auto", padding: "10px 12px", background: "#040a05", border: "1px solid #0d2010", borderRadius: 4, fontFamily: "'Share Tech Mono', monospace", fontSize: "0.5rem", color: "#3d6a50", lineHeight: 1.8, letterSpacing: "0.05em" }}>
             <div style={{ color: "#a8ff4d", marginBottom: 4 }}>SYSTEM ARCHITECTURE</div>
-            <div>Robot → WS /api/ws/bot_camera → C++ Server (local) → browser</div>
-            <div>Robot → WS /api/ws/bot → C++ AI Decision → /api/ws/frontend</div>
-            <div>Browser → POST /api/command → C++ Server → Robot polling</div>
+            <div>Robot → WS /api/ws/bot_camera → Python Server → /api/ws/camera_feed → browser</div>
+            <div>Robot → WS /api/ws/bot → Python AI Decision → /api/ws/frontend</div>
+            <div>Browser → POST /api/command → Python Server → Robot polling</div>
           </div>
         </div>
 

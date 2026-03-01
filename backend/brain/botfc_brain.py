@@ -100,7 +100,6 @@ ROLE_DEFENDER = "DEFENDER"
 ROLE_BALANCED = "BALANCED"
 
 STATE_INIT     = "INIT"
-STATE_STANDBY  = "STANDBY"
 STATE_SEARCH   = "SEARCH"
 STATE_APPROACH = "APPROACH"
 STATE_ALIGN    = "ALIGN"
@@ -484,12 +483,12 @@ class MLDataLogger(object):
 # CameraStreamer – JPEG frames via WS to server
 # ─────────────────────────────────────────────
 class CameraStreamer(object):
-    """Grabs JPEG frames from NAOqi and streams them to the C++ server via
+    """Grabs JPEG frames from NAOqi and streams them to the server via
     WebSocket /api/ws/bot_camera.  The server stores the latest frame and
     relays it to browser clients on /api/ws/camera_feed.
 
-    Tries kJpegColorSpace (21) first for zero-CPU hardware encoding.
-    Falls back to kRGBColorSpace (11) + PIL if JPEG frames are invalid.
+    Tries kJpegColorSpace=21 first; falls back to kRGBColorSpace=11 if
+    the firmware rejects it, encoding to JPEG via PIL.
     """
 
     def __init__(self, robot_ip, robot_port, server_host, server_port):
@@ -501,7 +500,7 @@ class CameraStreamer(object):
         self.thread      = None
         self._vid        = None
         self._cam_client = ""
-        self._fmt        = STREAM_CAM_FORMAT  # active format (21 or 11)
+        self._fmt        = STREAM_CAM_FORMAT  # 21=kJpeg, 11=kRGB
 
     def start(self):
         if self.running:
@@ -512,36 +511,37 @@ class CameraStreamer(object):
             print("[CamStream] ALVideoDevice unavailable: {}".format(e))
             return
 
-        # Try kJpegColorSpace (21) first; if it fails fall back to kRGBColorSpace (11)
+        # Clean up any stale subscription from a previous crashed run
+        try:
+            self._vid.unsubscribe("BotFC_Stream")
+        except Exception:
+            pass
+
+        # Try kJpegColorSpace first, fall back to kRGBColorSpace
+        handle = None
         for fmt, label in ((21, "kJpeg"), (11, "kRGB")):
             try:
-                # Remove any stale subscription that might block the slot
-                try:
-                    self._vid.unsubscribe("BotFC_Stream")
-                except Exception:
-                    pass
                 handle = self._vid.subscribeCamera(
-                    "BotFC_Stream", STREAM_CAM_ID, STREAM_CAM_RES, fmt, STREAM_CAM_FPS)
+                    "BotFC_Stream", STREAM_CAM_ID, STREAM_CAM_RES,
+                    fmt, STREAM_CAM_FPS)
                 if handle:
-                    self._cam_client = handle
                     self._fmt = fmt
-                    print("[CamStream] Subscribed fmt={} ({}) handle='{}'".format(
-                        fmt, label, handle))
+                    print("[CamStream] subscribeCamera OK with {} (fmt={})".format(label, fmt))
                     break
-                print("[CamStream] subscribeCamera fmt={} returned empty handle.".format(fmt))
-            except Exception as e:
-                print("[CamStream] subscribeCamera fmt={} failed: {}".format(fmt, e))
+            except Exception as sub_e:
+                print("[CamStream] subscribeCamera fmt={} failed: {}".format(fmt, sub_e))
 
-        if not self._cam_client:
-            print("[CamStream] Camera unavailable – stream disabled.")
+        if not handle:
+            print("[CamStream] Could not subscribe to camera – aborting.")
             return
 
+        self._cam_client = handle
         self.running = True
         self.thread  = threading.Thread(target=self._loop)
         self.thread.daemon = True
         self.thread.start()
-        print("[CamStream] Streaming fmt={} -> {}:{}".format(
-            self._fmt, self.server_host, self.server_port))
+        print("[CamStream] Started stream to {}:{}.".format(
+            self.server_host, self.server_port))
 
     def stop(self):
         self.running = False
@@ -554,21 +554,18 @@ class CameraStreamer(object):
                 pass
 
     def _to_jpeg(self, img):
-        """Return (jpg_bytes, w, h) from a NAOqi image tuple, or (None, 0, 0)."""
+        """Return (jpg_bytes_as_str, w, h) or (None, 0, 0) on bad frame."""
         if not img or len(img) <= 6:
             return None, 0, 0
         w, h, raw = int(img[0]), int(img[1]), img[6]
         if not raw:
             return None, w, h
-
-        if self._fmt == 21:  # kJpegColorSpace: img[6] is already JPEG bytes
+        if self._fmt == 21:   # kJpegColorSpace: img[6] is already JPEG bytes
             jpg = bytes(bytearray(raw))
-            # Validate JPEG SOI marker (0xFF 0xD8)
-            if len(jpg) < 3 or bytearray(jpg[:2]) != bytearray([0xff, 0xd8]):
-                print("[CamStream] Invalid JPEG header (len={}) – bad frame".format(len(jpg)))
-                return None, w, h
+            ba = bytearray(jpg)
+            if len(ba) < 3 or ba[0] != 0xff or ba[1] != 0xd8:
+                return None, w, h   # corrupt frame
             return jpg, w, h
-
         # kRGBColorSpace (11): encode via PIL
         try:
             import StringIO as _sio
@@ -576,7 +573,7 @@ class CameraStreamer(object):
             rgb     = bytes(bytearray(raw))
             pil_img = _Img.frombytes("RGB", (w, h), rgb)
             buf     = _sio.StringIO()
-            pil_img.save(buf, format="JPEG", quality=75)
+            pil_img.save(buf, format="JPEG", quality=70)
             return buf.getvalue(), w, h
         except Exception as enc_e:
             print("[CamStream] PIL encode error: {}".format(enc_e))
@@ -586,14 +583,16 @@ class CameraStreamer(object):
         import socket as _socket
         import base64 as _b64
 
+        bad_frames = 0
+
         while self.running:
             sock = None
             try:
                 sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
-                sock.settimeout(5)   # connect + handshake timeout only
+                sock.settimeout(5)
                 sock.connect((self.server_host, self.server_port))
 
-                ws_key    = _b64.b64encode(os.urandom(16))
+                ws_key = _b64.b64encode(os.urandom(16))
                 handshake = (
                     "GET /api/ws/bot_camera HTTP/1.1\r\n"
                     "Host: {host}:{port}\r\n"
@@ -610,46 +609,41 @@ class CameraStreamer(object):
                 while b"\r\n\r\n" not in resp:
                     chunk = sock.recv(4096)
                     if not chunk:
-                        raise Exception("Handshake EOF")
+                        raise Exception("Handshake failed")
                     resp += chunk
 
                 if b"101" not in resp.split(b"\r\n")[0]:
-                    raise Exception("WS upgrade rejected: {}".format(
-                        resp.split(b"\r\n")[0].decode("utf-8", errors="replace")))
+                    raise Exception("WS upgrade rejected: " + repr(resp[:200]))
 
-                # Remove timeout for the streaming phase so large frames don't abort
+                # Remove timeout for the streaming phase so large frames
+                # do not abort the connection
                 sock.settimeout(None)
-                print("[CamStream] WS connected. Streaming fmt={} @ {}fps".format(
-                    self._fmt, STREAM_CAM_FPS))
 
-                interval   = 1.0 / STREAM_CAM_FPS
+                print("[CamStream] Connected.")
                 bad_frames = 0
+                interval = 1.0 / STREAM_CAM_FPS
 
                 while self.running:
-                    t0  = time.time()
+                    t0 = time.time()
                     img = self._vid.getImageRemote(self._cam_client)
                     jpg, w, h = self._to_jpeg(img)
-
-                    if img:
-                        try:
-                            self._vid.releaseImage(self._cam_client)
-                        except Exception:
-                            pass
-
                     if jpg:
-                        bad_frames = 0
-                        b64     = _b64.b64encode(jpg).decode("ascii")
+                        b64 = _b64.b64encode(jpg).decode("ascii")
                         payload = json.dumps({"type": "frame", "w": w, "h": h, "jpg": b64})
                         TelemetryClient._ws_send(sock, payload)
+                        bad_frames = 0
                     else:
                         bad_frames += 1
-                        if bad_frames == 5:
-                            print("[CamStream] {} consecutive bad frames – "
-                                  "camera may need different format.".format(bad_frames))
-
-                    wait = interval - (time.time() - t0)
-                    if wait > 0:
-                        time.sleep(wait)
+                        if bad_frames % 20 == 1:
+                            print("[CamStream] {} bad/empty frames so far".format(bad_frames))
+                    try:
+                        self._vid.releaseImage(self._cam_client)
+                    except Exception:
+                        pass
+                    elapsed = time.time() - t0
+                    remaining = interval - elapsed
+                    if remaining > 0:
+                        time.sleep(remaining)
 
                 TelemetryClient._ws_close(sock)
             except Exception as e:
@@ -895,17 +889,13 @@ class BotFCBrain(object):
             self.motion   = ALProxy("ALMotion",         self.robot_ip, self.robot_port)
             self.posture  = ALProxy("ALRobotPosture",   self.robot_ip, self.robot_port)
             self.memory   = ALProxy("ALMemory",         self.robot_ip, self.robot_port)
+            self.tts      = ALProxy("ALTextToSpeech",   self.robot_ip, self.robot_port)
             self.leds     = ALProxy("ALLeds",           self.robot_ip, self.robot_port)
             self.ball_det = ALProxy("ALRedBallDetection", self.robot_ip, self.robot_port)
             self.sonar_p  = ALProxy("ALSonar",          self.robot_ip, self.robot_port)
         except Exception as e:
             print("[BotFC] FATAL: Failed to init proxies: {}".format(e))
             return
-
-        try:
-            self.tts = ALProxy("ALTextToSpeech", self.robot_ip, self.robot_port)
-        except Exception as e:
-            print("[BotFC] ALTextToSpeech unavailable (muted mode): {}".format(e))
 
         try:
             self.battery = ALProxy("ALBattery", self.robot_ip, self.robot_port)
@@ -945,8 +935,7 @@ class BotFCBrain(object):
         except Exception as e:
             print("[BotFC] Bottom camera unavailable: {}".format(e))
 
-        if self.tts:
-            self.tts.post.say("Brain online. Let's play football.")
+        self.tts.post.say("Brain online. Let's play football.")
 
         try:
             p = self.motion.getRobotPosition(True)
@@ -957,14 +946,10 @@ class BotFCBrain(object):
         self.last_ball_time = time.time()  # start grace period from NOW, not -100s
 
         with self.lock:
-            self.state = STATE_STANDBY
+            self.state = STATE_SEARCH
 
         self.running = True
-        # data_logger subscribes camera 0 with kRGB (format 9) which conflicts
-        # with CameraStreamer (kJpeg, format 21) on the same physical camera,
-        # causing empty frames.  Keep data_logger stopped; telemetry is still
-        # updated in-memory and logged via update_telemetry / log_game_state.
-        # self.data_logger.start()
+        self.data_logger.start()
         self.telemetry_client.start(self.trait)
         self.camera_streamer.start()
         self.command_poller.start()
@@ -1047,7 +1032,7 @@ class BotFCBrain(object):
                 if srv_cmd == "STOP":
                     self.motion.stopMove()
                     with self.lock:
-                        self.state = STATE_STANDBY
+                        self.state = STATE_SEARCH
                 elif srv_cmd in (STATE_SEARCH, STATE_APPROACH, STATE_ALIGN, STATE_KICK):
                     with self.lock:
                         self.state = srv_cmd
@@ -1070,7 +1055,7 @@ class BotFCBrain(object):
                 if self.running:
                     self._ensure_standing()
                     with self.lock:
-                        self.state = STATE_STANDBY
+                        self.state = STATE_SEARCH
                 continue
 
             # ── Fall recovery (mid-match) ──────────────────────────────────
@@ -1088,7 +1073,7 @@ class BotFCBrain(object):
                 except Exception:
                     pass
                 with self.lock:
-                    self.state = STATE_STANDBY
+                    self.state = STATE_SEARCH
                 continue
 
             self._safety_check()
@@ -1150,15 +1135,14 @@ class BotFCBrain(object):
             if s != STATE_HALFTIME:
                 self._enforce_bounds()
 
-                if   s == STATE_STANDBY:  pass   # wait for SEARCH command from operator
-                elif s == STATE_SEARCH:   self._do_search()
+                if   s == STATE_SEARCH:   self._do_search()
                 elif s == STATE_APPROACH: self._do_approach()
                 elif s == STATE_ALIGN:    self._do_align()
                 elif s == STATE_KICK:     self._do_kick()
                 elif s == STATE_TACKLE:   self._do_tackle()
                 else:
                     with self.lock:
-                        self.state = STATE_STANDBY
+                        self.state = STATE_SEARCH
 
             time.sleep(0.05)
 
@@ -1338,8 +1322,7 @@ class BotFCBrain(object):
         else:
             phrase = "Motors at {}. I need a {} second break.".format(int(max_t), secs)
 
-        if self.tts:
-            self.tts.post.say(phrase)
+        self.tts.post.say(phrase)
         self.leds.fadeRGB("AllLeds", 0xFFA200, 0.15)
         self.posture.goToPosture("Crouch", 0.8)
         self.motion.setStiffnesses("Body", 0.0)
@@ -1352,7 +1335,7 @@ class BotFCBrain(object):
                 break
             with self.lock:
                 self.break_remaining = r
-            if r % 30 == 0 and self.tts:
+            if r % 30 == 0:
                 self.tts.post.say("{} minutes remaining.".format(r // 60))
             time.sleep(1)
 
@@ -1360,8 +1343,7 @@ class BotFCBrain(object):
             self.break_remaining = 0
 
         if self.running:
-            if self.tts:
-                self.tts.post.say("Cooling complete.")
+            self.tts.post.say("Cooling complete.")
             self.motion.setStiffnesses("Body", 1.0)
             self.posture.goToPosture("StandInit", 1.0)
             with self.lock:
@@ -1394,8 +1376,7 @@ class BotFCBrain(object):
                     self.last_ball_time = time.time()
                     self.state = STATE_APPROACH
                 self.motion.setAngles("HeadPitch", 0.15, 0.2)
-                if self.tts:
-                    self.tts.post.say("Ball found!")
+                self.tts.post.say("Ball found!")
                 return
             # Single-frame ghost: fall through and keep sweeping.
 
@@ -1437,8 +1418,7 @@ class BotFCBrain(object):
 
         now = time.time()
         if now - self.last_man_on_time > 4.0:
-            if self.tts:
-                self.tts.post.say("Man on, man on")
+            self.tts.post.say("Man on, man on")
             self.last_man_on_time = now
 
         # Update model if a fresh reading exists.
@@ -1529,8 +1509,7 @@ class BotFCBrain(object):
 
         now = time.time()
         if now - self.last_man_on_time > 4.0:
-            if self.tts:
-                self.tts.post.say("Man on, man on")
+            self.tts.post.say("Man on, man on")
             self.last_man_on_time = now
 
         # In ALIGN we prioritise the bottom camera but still accept top-cam data.
@@ -1574,8 +1553,7 @@ class BotFCBrain(object):
         # ── Kick-ready transition ─────────────────────────────────────────
         if abs(bx) < KICK_BX_MAX and bsz > KICK_BSZ_READY:
             self.motion.stopMove()
-            if self.tts:
-                self.tts.post.say("I see the goal")
+            self.tts.post.say("I see the goal")
             with self.lock:
                 self.state = STATE_KICK
             return
@@ -1596,8 +1574,7 @@ class BotFCBrain(object):
     def _do_tackle(self):
         self.leds.fadeRGB("AllLeds", 0xFF0000, 0.15)
         try:
-            if self.tts:
-                self.tts.post.say("Pushing!")
+            self.tts.post.say("Pushing!")
             self.motion.setStiffnesses("Body", 1.0)
             self.posture.goToPosture("StandInit", 0.8)
             self.motion.setAngles(["LShoulderPitch", "RShoulderPitch"], [0.0, 0.0], 0.3)
@@ -1675,8 +1652,7 @@ class BotFCBrain(object):
         side_step_y = -0.04 if bx < -0.02 else 0.04
         kick_leg    = "L"   if bx < -0.02 else "R"
 
-        if self.tts:
-            self.tts.post.say("Kick!")
+        self.tts.post.say("Kick!")
 
         try:
             self.posture.goToPosture("Stand", 0.8)

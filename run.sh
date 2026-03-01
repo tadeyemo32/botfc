@@ -2,7 +2,7 @@
 # ─────────────────────────────────────────────
 # Bot FC – Full System Runner
 # ─────────────────────────────────────────────
-# 1. Compiles & launches C++ Boost server
+# 1. Launches Python FastAPI server (uvicorn)
 # 2. Boots Vite Frontend
 # 3. Deploys Python brain to NAO robot
 # ─────────────────────────────────────────────
@@ -14,23 +14,18 @@ TRAIT="${1:-balanced}"
 
 echo "================================================="
 echo "   Bot FC - Full System Launcher                 "
-echo "   C++ Server + Vite Frontend + Python Brain     "
+echo "   Python Server + Vite Frontend + Python Brain  "
 echo "================================================="
 
 # Kill any lingering processes
 echo "[i] Cleaning up zombie processes..."
 pkill -f "vite" || true
-pkill -f "botfc_server" || true
+pkill -f "uvicorn" || true
 lsof -ti :5050 | xargs kill -9 2>/dev/null || true
 
-# 1. Compile Backend Server
-echo "[i] Compiling the Boost::Beast C++ Backend Server..."
-mkdir -p "$BACKEND_DIR/build"
-cd "$BACKEND_DIR/build" || exit
-cmake ..
-make -j4
-mkdir -p "$SCRIPT_DIR/bin"
-cp botfc_server "$SCRIPT_DIR/bin/"
+# 1. Install Python dependencies if needed
+echo "[i] Checking Python dependencies..."
+python3 -m pip install --break-system-packages -q -r "$BACKEND_DIR/requirements.txt"
 
 # 2. Boot Frontend Interface
 echo "[i] Booting Vite Frontend on port 5173..."
@@ -41,11 +36,11 @@ if [ ! -d "node_modules" ]; then
 fi
 npm run dev &
 
-# 3. Launch Backend Orchestrator (background)
+# 3. Launch Python API Server
 echo ""
-echo "[i] Bot FC – Launching C++ Server (botfc_server)..."
-cd "$SCRIPT_DIR/bin" || exit
-./botfc_server &
+echo "[i] Bot FC – Launching Python Server (uvicorn)..."
+cd "$SCRIPT_DIR" || exit
+python3 -m uvicorn backend.api.server:app --host 0.0.0.0 --port 5050 &
 SERVER_PID=$!
 sleep 2
 
