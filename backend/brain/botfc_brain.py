@@ -580,18 +580,45 @@ class CameraStreamer(object):
             return None, w, h
 
     def _loop(self):
+        import socket as _socket
         import base64 as _b64
 
         bad_frames = 0
 
         while self.running:
-            ws = None
+            sock = None
             try:
-                from websocket import create_connection
-                url = "ws://{}:{}/api/ws/bot_camera".format(self.server_host, self.server_port)
-                print("[CamStream] Connecting to {}...".format(url))
-                ws = create_connection(url, timeout=5)
-                print("[CamStream] Connected.")
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                sock.settimeout(5)
+                print("[CamStream] Connecting to {}:{}...".format(self.server_host, self.server_port))
+                sock.connect((self.server_host, self.server_port))
+
+                ws_key = _b64.b64encode(os.urandom(16))
+                handshake = (
+                    "GET /api/ws/bot_camera HTTP/1.1\r\n"
+                    "Host: {host}:{port}\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n"
+                    "User-Agent: BotFC-CamStream-v1\r\n"
+                    "\r\n"
+                ).format(host=self.server_host, port=self.server_port, key=ws_key)
+                sock.sendall(handshake.encode("utf-8"))
+
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        raise Exception("Handshake failed: no response")
+                    resp += chunk
+
+                resp_lines = resp.split(b"\r\n")
+                if resp_lines and b"101" not in resp_lines[0]:
+                    raise Exception("WS upgrade failed: " + repr(resp_lines[0][:100]))
+
+                print("[CamStream] Connected (handshake OK).")
+                sock.settimeout(None)  # Remove timeout for streaming
                 bad_frames = 0
                 interval = 1.0 / STREAM_CAM_FPS
 
@@ -602,7 +629,7 @@ class CameraStreamer(object):
                     if jpg:
                         b64 = _b64.b64encode(jpg).decode("ascii")
                         payload = json.dumps({"type": "frame", "w": w, "h": h, "jpg": b64})
-                        ws.send(payload)
+                        TelemetryClient._ws_send(sock, payload)
                         bad_frames = 0
                     else:
                         bad_frames += 1
@@ -617,13 +644,16 @@ class CameraStreamer(object):
                     if remaining > 0:
                         time.sleep(remaining)
 
-                ws.close()
+                try:
+                    TelemetryClient._ws_close(sock)
+                except Exception:
+                    pass
             except Exception as e:
                 print("[CamStream] Error: {}. Retry in 3s...".format(e))
             finally:
-                if ws:
+                if sock:
                     try:
-                        ws.close()
+                        sock.close()
                     except Exception:
                         pass
             if self.running:
