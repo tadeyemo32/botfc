@@ -305,7 +305,10 @@ class TelemetryClient(object):
 
                 self._ws_close(sock)
             except Exception as e:
-                print("[Telemetry] Error: {}. Retrying in 2s...".format(e))
+                err = str(e)
+                # Broken pipe = server went down; suppress noise, just reconnect
+                if "Broken pipe" not in err and "EPIPE" not in err:
+                    print("[Telemetry] {}: reconnecting in 2s...".format(err))
             finally:
                 if sock:
                     try:
@@ -588,6 +591,61 @@ class CameraStreamer(object):
 
 
 # ─────────────────────────────────────────────
+# CommandPoller – receives action commands from C++ server
+# ─────────────────────────────────────────────
+class CommandPoller(object):
+    """Polls GET /api/bot/command every 0.5 s.
+
+    The C++ server queues commands issued by the frontend operator or its
+    own decision engine.  A pending command is returned once and cleared so
+    the robot doesn't repeat it.  Valid actions: SEARCH, APPROACH, ALIGN,
+    KICK, STOP.
+    """
+
+    def __init__(self, server_host, server_port):
+        self.host    = server_host
+        self.port    = server_port
+        self.running = False
+        self.thread  = None
+        self._cmd    = None
+        self.lock    = threading.Lock()
+
+    def start(self):
+        self.running = True
+        self.thread  = threading.Thread(target=self._loop)
+        self.thread.daemon = True
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+
+    def _loop(self):
+        import httplib  # Python 2.7
+        while self.running:
+            try:
+                conn = httplib.HTTPConnection(self.host, self.port, timeout=2)
+                conn.request("GET", "/api/bot/command")
+                r = conn.getresponse()
+                if r.status == 200:
+                    data = json.loads(r.read())
+                    action = data.get("action")
+                    if action:
+                        with self.lock:
+                            self._cmd = action
+                conn.close()
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+    def get_and_clear(self):
+        """Return pending command string or None."""
+        with self.lock:
+            cmd = self._cmd
+            self._cmd = None
+        return cmd
+
+
+# ─────────────────────────────────────────────
 # BotFCBrain
 # ─────────────────────────────────────────────
 class BotFCBrain(object):
@@ -635,6 +693,7 @@ class BotFCBrain(object):
         self.telemetry_client = TelemetryClient(server_ip, server_port)
         self.data_logger      = MLDataLogger(robot_ip, robot_port)
         self.camera_streamer  = CameraStreamer(robot_ip, robot_port, server_ip, server_port)
+        self.command_poller   = CommandPoller(server_ip, server_port)
 
         # NAOqi proxies (initialised in start())
         self.motion    = None
@@ -825,6 +884,7 @@ class BotFCBrain(object):
         self.data_logger.start()
         self.telemetry_client.start(self.trait)
         self.camera_streamer.start()
+        self.command_poller.start()
 
         self.fsm_thread = threading.Thread(target=self._run)
         self.fsm_thread.daemon = True
@@ -840,6 +900,7 @@ class BotFCBrain(object):
         self.data_logger.stop()
         self.telemetry_client.stop()
         self.camera_streamer.stop()
+        self.command_poller.stop()
 
         if self.fsm_thread and self.fsm_thread.is_alive():
             self.fsm_thread.join(timeout=5)
@@ -894,6 +955,23 @@ class BotFCBrain(object):
     # ─── FSM Main Loop ──────────────────────
     def _run(self):
         while self.running:
+            # ── Server command override ────────────────────────────────────
+            # The C++ server (or frontend operator) can push commands via
+            # POST /api/command.  We honour them here, before the kill switch,
+            # so the operator always has full authority.
+            srv_cmd = self.command_poller.get_and_clear()
+            if srv_cmd:
+                if srv_cmd == "STOP":
+                    self.motion.stopMove()
+                    with self.lock:
+                        self.state = STATE_SEARCH
+                elif srv_cmd in (STATE_SEARCH, STATE_APPROACH, STATE_ALIGN, STATE_KICK):
+                    with self.lock:
+                        self.state = srv_cmd
+                elif srv_cmd == "KICK_NOW":
+                    with self.lock:
+                        self.state = STATE_KICK
+
             # ── Kill switch (head touch) ───────────────────────────────────
             if self._check_kill_switch():
                 self.motion.stopMove()

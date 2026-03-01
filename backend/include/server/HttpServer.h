@@ -34,6 +34,13 @@ public:
   void setRobotIp(const std::string &ip);
   std::string getRobotIp();
 
+  // Local C++ decision engine – computes recommended FSM action from telemetry
+  std::string computeDecision();
+
+  // Command channel (frontend/server → bot)
+  void queueBotCommand(const nlohmann::json &cmd);
+  nlohmann::json popBotCommand(); // returns {"action":null} if empty
+
 private:
   void doAccept();
 
@@ -45,8 +52,12 @@ private:
   std::set<std::shared_ptr<WsSession>> camera_sessions_;
 
   nlohmann::json latest_telemetry_;
-  std::string latest_frame_; // latest camera frame JSON from bot
+  std::string latest_frame_;
   std::string robot_ip_;
+
+  // Pending command for the robot (server-computed or frontend-issued)
+  nlohmann::json pending_bot_command_;
+  bool has_pending_command_ = false;
 
   friend class HttpSession;
 };
