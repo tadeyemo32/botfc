@@ -2427,7 +2427,7 @@ class BotFCBrain(object):
             pass
         min_sonar = min(sl, sr)
 
-        if min_sonar <= COMBAT_DISTANCE and min_sonar < bsz * 5.0 + 0.1:
+        if min_sonar <= COMBAT_DISTANCE and min_sonar < self.ball_model.bsz * 5.0 + 0.1:
             self.motion.stopMove()
             with self.lock:
                 self.state = STATE_TACKLE
@@ -2442,6 +2442,15 @@ class BotFCBrain(object):
             return
 
         # ── Body movement: P-Controller & Look-Then-Walk ───
+        # Retrieve the necessary states from ball_model since head tracking
+        # is now fully decoupled
+        try:
+            head_yaw = self.motion.getAngles("HeadYaw", False)[0]
+        except Exception:
+            head_yaw = 0.0
+
+        track_bx = self.ball_model.pred_bx if self.ball_model.confidence > 0.8 else self.ball_model.bx
+
         # The ball's world-relative bearing is approximately:
         #   ball_bearing ≈ head_yaw + track_bx  (positive = ball to the left)
         ball_bearing = head_yaw + track_bx
@@ -2463,7 +2472,7 @@ class BotFCBrain(object):
             
             # Advancing to ball: increase speed multiplier so it doesn't walk too slow
             speed = max(0.40,  # Minimum walk speed (was too slow before)
-                        min(APPROACH_MAX_SPEED, (dist - KICK_APPROACH_DIST) * 1.5))
+                        min(APPROACH_MAX_SPEED, (self.ball_model.dist - KICK_APPROACH_DIST) * 1.5))
 
         self._stable_walk(speed, 0.0, body_turn)
 
