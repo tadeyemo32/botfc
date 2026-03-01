@@ -1816,15 +1816,8 @@ class BotFCBrain(object):
             return None
 
     def _detect_goal_posts(self):
-        """Detect goal posts using multiple colour profiles for different
-        lighting conditions (bright yellow, dim yellow, white posts).
-
-        Scans through GOAL_POST_PROFILES and uses whichever profile finds
-        the most matching pixels above the minimum threshold.  Also checks
-        that the blob has a vertical shape (taller than it is wide) to
-        distinguish actual posts from floor markings or other yellow objects.
-
-        Returns a world-relative bearing to the goal, or None.
+        """Detect goal posts using OpenCV color thresholding for yellow/white posts.
+        Returns a world-relative bearing to the goal (center of two posts or one post), or None.
         """
         if not (self._vid and self._bot_cam_client):
             return None
@@ -1836,73 +1829,63 @@ class BotFCBrain(object):
             height = int(img[1])
             pixels = bytearray(img[6])
 
-            # Only scan top 65% of frame.
+            import numpy as np
+            import cv2
+            
+            frame = np.frombuffer(pixels, dtype=np.uint8).reshape((height, width, 3))
+            
+            # Use top 65% of the frame
             scan_rows = int(height * 0.65)
-            stride = BOT_CAM_STRIDE * 3
-            max_offset = min(scan_rows * width * 3, len(pixels) - 2)
-
-            best_count  = 0
-            best_bx_sum = 0
-            best_y_min  = height
-            best_y_max  = 0
-            best_label  = ""
-
-            for prof in GOAL_POST_PROFILES:
-                p_r_min, p_g_min, p_b_max, p_diff, p_label = prof
-                bx_sum = count = 0
-                y_min = height
-                y_max = 0
-
-                for off in range(0, max_offset, stride):
-                    b = pixels[off]
-                    g = pixels[off + 1]
-                    r = pixels[off + 2]
-
-                    match = False
-                    if p_diff >= 0:
-                        # Coloured post (yellow): R/G high, B low.
-                        if (r > p_r_min and g > p_g_min
-                                and b < p_b_max
-                                and min(r, g) - b > p_diff):
-                            match = True
-                    else:
-                        # White post: all channels high and close together.
-                        if (r > p_r_min and g > p_g_min
-                                and b > 170
-                                and abs(r - g) < 35 and abs(r - b) < 35):
-                            match = True
-
-                    if match:
-                        px = (off // 3) % width
-                        py = (off // 3) // width
-                        bx_sum += px
-                        if py < y_min:
-                            y_min = py
-                        if py > y_max:
-                            y_max = py
-                        count += 1
-
-                if count > best_count:
-                    best_count  = count
-                    best_bx_sum = bx_sum
-                    best_y_min  = y_min
-                    best_y_max  = y_max
-                    best_label  = p_label
-
+            frame_roi = frame[:scan_rows, :, :]
+            
+            hsv = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2HSV)
+            
+            # Yellow posts
+            lower_yellow = np.array([20, 100, 100])
+            upper_yellow = np.array([35, 255, 255])
+            mask_yellow = cv2.inRange(hsv, lower_yellow, upper_yellow)
+            
+            # White posts (fallback)
+            lower_white = np.array([0, 0, 200])
+            upper_white = np.array([180, 50, 255])
+            mask_white = cv2.inRange(hsv, lower_white, upper_white)
+            
+            mask = cv2.bitwise_or(mask_yellow, mask_white)
+            
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            posts = []
+            for cnt in contours:
+                area = cv2.contourArea(cnt)
+                if area < GOAL_POST_MIN_PX:
+                    continue
+                x, y, w, h = cv2.boundingRect(cnt)
+                # Aspect ratio check: posts are tall and thin
+                if h < width * GOAL_POST_MIN_HEIGHT_RATIO:
+                    continue
+                if float(h) / max(1, w) < 1.0:  # must be taller than wide
+                    continue
+                posts.append((x + w / 2.0, area))
+            
             self._vid.releaseImage(self._bot_cam_client)
 
-            if best_count < GOAL_POST_MIN_PX:
+            if not posts:
                 return None
 
-            # Shape check: blob must be vertically tall (goal posts are vertical).
-            blob_height = best_y_max - best_y_min
-            if blob_height < height * GOAL_POST_MIN_HEIGHT_RATIO:
-                return None  # too flat — probably floor marking or noise
+            posts.sort(key=lambda p: p[1], reverse=True)
+            
+            if len(posts) >= 2:
+                # Take the two largest blobs as the two posts
+                p1_x = posts[0][0]
+                p2_x = posts[1][0]
+                goal_cx_px = (p1_x + p2_x) / 2.0
+            else:
+                # Only one post visible
+                goal_cx_px = posts[0][0]
 
-            # Centroid x, normalised to [-0.5, 0.5]
-            goal_cx = (float(best_bx_sum) / best_count - width * 0.5) / width
+            # Centroid x, normalised to [-0.5, 0.5], positive is LEFT
+            goal_cx = -(goal_cx_px - width * 0.5) / width
 
-            # NAO bottom camera HFOV ≈ 47.64° = 0.831 rad
             cam_bearing = goal_cx * BOT_CAM_HFOV
 
             head_yaw = 0.0
@@ -1911,7 +1894,7 @@ class BotFCBrain(object):
             except Exception:
                 pass
 
-            world_bearing = head_yaw - cam_bearing
+            world_bearing = head_yaw + cam_bearing
 
             # EMA smoothing.
             now = time.time()
@@ -1934,35 +1917,46 @@ class BotFCBrain(object):
 
     # ─── Goal scored detection ──────────────────
     def _check_goal_scored(self):
-        """Check if the ball has disappeared after a kick (implying it went
-        into the goal).  Called right after the kick motion completes.
-
-        Strategy:
-        1. The ball was at the robot's feet and we kicked toward goal_bearing.
-        2. Look ahead in the kick direction for ~1 second.
-        3. If the ball is NOT detected in most samples → we scored!
-        4. If we still see the ball → it didn't go in (or went wide).
-
-        Returns True if a goal was likely scored.
-        """
+        """Check if the ball trajectory went towards the goal before disappearing."""
         # Wait for the ball to travel.
         time.sleep(GOAL_CHECK_DELAY)
 
-        # Look in the kick direction.
         self.motion.setAngles("HeadYaw",   0.0,  0.3)
-        self.motion.setAngles("HeadPitch", 0.20, 0.3)  # look slightly down/ahead
+        self.motion.setAngles("HeadPitch", 0.20, 0.3)
         time.sleep(0.3)
 
         ball_gone_count = 0
+        last_seen_world_bearing = None
+
         for _ in range(GOAL_CHECK_SAMPLES):
             ball = self._read_ball()
             if ball is None:
                 ball = self._detect_bottom_cam()
+                
             if ball is None:
                 ball_gone_count += 1
+            else:
+                try:
+                    head_yaw = self.motion.getAngles("HeadYaw", False)[0]
+                    last_seen_world_bearing = head_yaw + ball[0] 
+                except Exception:
+                    pass
             time.sleep(GOAL_CHECK_INTERVAL)
 
-        return ball_gone_count >= GOAL_BALL_GONE_THRESH
+        # If ball disappeared
+        if ball_gone_count >= GOAL_BALL_GONE_THRESH:
+            # Check trajectory
+            goal_err = 0.0
+            if last_seen_world_bearing is not None:
+                goal_err = self.goal_bearing - last_seen_world_bearing
+                while goal_err >  math.pi: goal_err -= 2.0 * math.pi
+                while goal_err < -math.pi: goal_err += 2.0 * math.pi
+            
+            # If the ball was last seen within ~14 degrees of goal bearing before vanishing, it's a goal
+            if abs(goal_err) < 0.25:
+                return True
+                
+        return False
 
     # ─── Celebration ───────────────────────────
     def _do_celebrate(self):
