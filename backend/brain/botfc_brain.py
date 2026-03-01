@@ -37,6 +37,17 @@ COMBAT_DISTANCE  = 0.40
 MOTOR_TEMP_LIMIT = 60.0
 
 # ─────────────────────────────────────────────
+# Stability constants — adaptive gait controller
+# ─────────────────────────────────────────────
+STABILITY_TILT_WARN     = 0.20   # rad — start reducing speed
+STABILITY_TILT_DANGER   = 0.40   # rad — emergency slow / stop
+STABILITY_GYRO_WARN     = 1.5    # rad/s — angular velocity warning
+STABILITY_GYRO_DANGER   = 3.0    # rad/s — angular velocity, imminent fall
+STABILITY_SPEED_SCALE   = 0.3    # min speed multiplier at max instability
+STABILITY_RECOVERY_RATE = 0.05   # how fast speed limit recovers per cycle
+STABILITY_EMA_ALPHA     = 0.4    # smoothing for gyro signals
+
+# ─────────────────────────────────────────────
 # Ball model constants
 # ─────────────────────────────────────────────
 # bsz when the ball is exactly 1 m away – calibrate on field!
@@ -52,9 +63,25 @@ BALL_CONF_RAMP    = 1.5    # seconds of continuous tracking to reach full confid
 # ─────────────────────────────────────────────
 # Head-tracking / approach constants
 # ─────────────────────────────────────────────
-HEAD_TRACK_GAIN       = 0.50   # head servo gain (rad / bx unit)
-BODY_FOLLOW_THRESHOLD = 0.18   # |head_yaw| above which we rotate before walking
-ALIGN_BODY_DEADBAND   = 0.07   # bx dead-zone in ALIGN to kill oscillation
+HEAD_TRACK_GAIN       = 0.55   # head servo gain (rad / bx unit)
+BODY_FOLLOW_THRESHOLD = 0.12   # |head_yaw| above which we rotate before walking
+ALIGN_BODY_DEADBAND   = 0.06   # bx dead-zone in ALIGN to kill oscillation
+
+# ─────────────────────────────────────────────
+# Search constants
+# ─────────────────────────────────────────────
+SEARCH_WALK_DELAY     = 5.0    # seconds of pure scanning before walk+scan
+SEARCH_HEAD_SPEED     = 0.08   # rad/step head sweep speed
+SEARCH_PITCH_LOW      = 0.35   # pitch when looking at ground nearby (positive = down)
+SEARCH_PITCH_HIGH     = 0.15   # pitch when looking further ahead (still slightly down)
+
+# ─────────────────────────────────────────────
+# Approach constants
+# ─────────────────────────────────────────────
+APPROACH_MAX_SPEED    = 0.80   # max forward walk speed
+APPROACH_MIN_SPEED    = 0.25   # min forward speed when close
+APPROACH_TURN_GAIN    = 1.8    # body turn rate per unit head_yaw offset
+APPROACH_HEAD_RECENTER= 0.15   # speed to recenter head yaw during straight walk
 
 # ─────────────────────────────────────────────
 # Kick constants
@@ -64,6 +91,13 @@ KICK_VERIFY_INTERVAL = 0.05   # s between samples
 KICK_BSZ_READY       = 0.10   # ball must appear at least this large to kick
 KICK_BX_MAX          = 0.05   # horizontal tolerance before kicking
 KICK_APPROACH_DIST   = 0.22   # target distance (m) for kick walk-up
+
+# ─────────────────────────────────────────────
+# Goal alignment – bearing to opponent goal (radians from 
+# robot origin).  Striker kicks forward, defender kicks 
+# sideways-out.  These are overridden per-role in __init__.
+# ─────────────────────────────────────────────
+DEFAULT_GOAL_BEARING = 0.0    # straight ahead
 
 # ─────────────────────────────────────────────
 # Bottom camera (BGR, QVGA=320×240, 10 fps)
@@ -84,6 +118,28 @@ RED_G_MAX      = 110
 RED_DIFF_MIN   = 55    # red must exceed max(B,G) by this margin
 RED_MIN_PX     = 40    # minimum blob pixel count
 
+# Goal-post detection: multiple colour profiles to handle
+# different lighting / field setups (bright yellow, dim/warm,
+# white SPL posts).  Each profile is (R_min, G_min, B_max, diff_min, label).
+# diff_min < 0 means "white" mode (all channels high and close together).
+# ─────────────────────────────────────────────
+GOAL_POST_PROFILES = [
+    # (R_min, G_min, B_max, diff_min, label)
+    (150, 140,  80, 40, "yellow_bright"),  # standard SPL, good lighting
+    (130, 110,  90, 30, "yellow_dim"),     # indoor warm lighting
+    (190, 190, 210, -1, "white"),           # white goal posts
+]
+GOAL_POST_MIN_PX  = 15
+GOAL_POST_MIN_HEIGHT_RATIO = 0.10
+
+# ─────────────────────────────────────────────
+# Goal scored detection
+# ─────────────────────────────────────────────
+GOAL_CHECK_DELAY   = 0.8   # seconds after kick to start checking
+GOAL_CHECK_SAMPLES = 6     # number of frames to sample
+GOAL_CHECK_INTERVAL= 0.15  # seconds between samples
+GOAL_BALL_GONE_THRESH = 4  # if ball missing in this many samples → goal
+
 # ─────────────────────────────────────────────
 # Camera streamer constants (JPEG to server)
 # ─────────────────────────────────────────────
@@ -99,14 +155,15 @@ ROLE_STRIKER  = "STRIKER"
 ROLE_DEFENDER = "DEFENDER"
 ROLE_BALANCED = "BALANCED"
 
-STATE_INIT     = "INIT"
-STATE_SEARCH   = "SEARCH"
-STATE_APPROACH = "APPROACH"
-STATE_ALIGN    = "ALIGN"
-STATE_TACKLE   = "TACKLE"
-STATE_KICK     = "KICK"
-STATE_RECOVER  = "RECOVER"
-STATE_HALFTIME = "HALFTIME"
+STATE_INIT      = "INIT"
+STATE_SEARCH    = "SEARCH"
+STATE_APPROACH  = "APPROACH"
+STATE_ALIGN     = "ALIGN"
+STATE_TACKLE    = "TACKLE"
+STATE_KICK      = "KICK"
+STATE_CELEBRATE = "CELEBRATE"
+STATE_RECOVER   = "RECOVER"
+STATE_HALFTIME  = "HALFTIME"
 
 
 # ─────────────────────────────────────────────
@@ -182,7 +239,9 @@ class BallModel(object):
             self._tracking_since = now
 
         self.dist = max(0.1, BALL_K_CONST / max(self._bsz, 0.001))
-        self.last_heading = head_yaw + self._bx
+        # NAO convention: HeadYaw positive=left, bx positive=right-of-center.
+        # World heading of ball = head_yaw MINUS bx (both in rad approx).
+        self.last_heading = head_yaw - self._bx
         self.valid        = True
         self.last_seen    = now
         self._last_update_t = now
@@ -332,9 +391,11 @@ class TelemetryClient(object):
         else:
             frame.append(0x80 | 127)
             frame.extend(struct.pack("!Q", length))
-        mask = os.urandom(4)
-        frame.extend(mask)
-        masked = bytearray(b ^ mask[i % 4] for i, b in enumerate(data))
+        # Python 2 compat: os.urandom returns str, not bytes – XOR needs ints
+        mask_bytes = bytearray(os.urandom(4))
+        frame.extend(mask_bytes)
+        data_bytes = bytearray(data)
+        masked = bytearray(data_bytes[i] ^ mask_bytes[i % 4] for i in range(length))
         frame.extend(masked)
         sock.sendall(bytes(frame))
 
@@ -351,7 +412,132 @@ class TelemetryClient(object):
 # ─────────────────────────────────────────────
 # MLDataLogger  (unchanged from original)
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# StabilityController – adaptive gait & balance
+# ─────────────────────────────────────────────
+class StabilityController(object):
+    """Monitors IMU (roll/pitch + gyro) and adapts walk speed to keep
+    the robot upright.  Provides a speed_multiplier (0.3-1.0) that the
+    FSM should apply to all forward/lateral walk commands.
+
+    Features
+    --------
+    * Tilt-rate estimation from gyroscope (smoothed with EMA)
+    * Adaptive speed scaling: reduces walk speed proportionally to
+      instability to prevent falls before they happen
+    * Stability score (0-1) for ML training: 1 = perfectly stable
+    * Running statistics: total fall count, cumulative instability
+    """
+
+    def __init__(self):
+        # Smoothed signals
+        self.gyro_x      = 0.0   # roll rate  (rad/s)
+        self.gyro_y      = 0.0   # pitch rate (rad/s)
+        self.tilt_mag    = 0.0   # combined tilt magnitude
+        self.gyro_mag    = 0.0   # combined gyro magnitude
+        # Outputs
+        self.speed_mult  = 1.0   # 0.3-1.0 — multiply walk commands by this
+        self.stability   = 1.0   # 0-1 score for ML
+        self.is_unstable = False
+        # Stats for ML
+        self.fall_count        = 0
+        self.cumulative_instab = 0.0
+        self.cycles            = 0
+        self.wobble_events     = 0   # times speed was reduced
+
+    def update(self, roll, pitch, gx, gy):
+        """Call once per FSM cycle with IMU readings.
+
+        roll/pitch in radians (from AngleX/AngleY).
+        gx/gy in rad/s (from GyroscopeX/GyroscopeY).
+        """
+        a = STABILITY_EMA_ALPHA
+        self.gyro_x   = a * gx + (1.0 - a) * self.gyro_x
+        self.gyro_y   = a * gy + (1.0 - a) * self.gyro_y
+        self.tilt_mag = math.sqrt(roll * roll + pitch * pitch)
+        self.gyro_mag = math.sqrt(self.gyro_x ** 2 + self.gyro_y ** 2)
+        self.cycles  += 1
+
+        # ── Stability score (1.0 = perfect, 0.0 = falling) ────────────
+        tilt_score = max(0.0, 1.0 - self.tilt_mag / STABILITY_TILT_DANGER)
+        gyro_score = max(0.0, 1.0 - self.gyro_mag / STABILITY_GYRO_DANGER)
+        self.stability = min(tilt_score, gyro_score)
+        self.cumulative_instab += (1.0 - self.stability)
+
+        # ── Adaptive speed multiplier ─────────────────────────────────
+        # If tilting or angular velocity is high, reduce walk speed.
+        if self.tilt_mag > STABILITY_TILT_WARN or self.gyro_mag > STABILITY_GYRO_WARN:
+            # Proportional reduction
+            tilt_factor = max(STABILITY_SPEED_SCALE,
+                              1.0 - (self.tilt_mag - STABILITY_TILT_WARN) /
+                              (STABILITY_TILT_DANGER - STABILITY_TILT_WARN))
+            gyro_factor = max(STABILITY_SPEED_SCALE,
+                              1.0 - (self.gyro_mag - STABILITY_GYRO_WARN) /
+                              (STABILITY_GYRO_DANGER - STABILITY_GYRO_WARN))
+            target = max(STABILITY_SPEED_SCALE, min(tilt_factor, gyro_factor))
+            self.speed_mult = min(self.speed_mult, target)  # drop fast
+            self.is_unstable = True
+            self.wobble_events += 1
+        else:
+            # Slowly recover speed when stable
+            self.speed_mult = min(1.0, self.speed_mult + STABILITY_RECOVERY_RATE)
+            self.is_unstable = False
+
+    def record_fall(self):
+        self.fall_count += 1
+
+    def get_ml_dict(self):
+        """Return a dict of stability features for ML logging."""
+        return {
+            "stab_score":      round(self.stability, 3),
+            "stab_speed_mult": round(self.speed_mult, 3),
+            "stab_tilt_mag":   round(self.tilt_mag, 4),
+            "stab_gyro_mag":   round(self.gyro_mag, 4),
+            "stab_gyro_x":     round(self.gyro_x, 4),
+            "stab_gyro_y":     round(self.gyro_y, 4),
+            "stab_unstable":   1 if self.is_unstable else 0,
+            "stab_fall_count": self.fall_count,
+            "stab_wobbles":    self.wobble_events,
+        }
+
+
 class MLDataLogger(object):
+    """Comprehensive ML data logger — captures 40+ features per tick at ~20Hz.
+
+    Features logged (for TensorFlow training):
+    ─────────────────────────────────────────
+    FSM:       state, action taken, time in state
+    Ball:      position, velocity, size, distance, prediction, confidence
+    IMU:       roll, pitch, gyro_x, gyro_y, accel_x, accel_y, accel_z
+    Stability: score, speed_mult, tilt_mag, gyro_mag, fall_count
+    Joints:    all 26 joint angles (head, arms, hips, knees, ankles)
+    Feet:      4x pressure sensors (left front, left back, right front, right back)
+    Sonar:     left, right distances
+    Walk:      commanded speed_x, speed_y, speed_theta
+    System:    battery_pct, max_motor_temp, goal_bearing, goal_confidence
+    """
+
+    # Joint names for full body capture
+    JOINT_NAMES = [
+        "HeadYaw", "HeadPitch",
+        "LShoulderPitch", "LShoulderRoll", "LElbowYaw", "LElbowRoll",
+        "LWristYaw", "LHand",
+        "LHipYawPitch", "LHipRoll", "LHipPitch",
+        "LKneePitch", "LAnklePitch", "LAnkleRoll",
+        "RHipYawPitch", "RHipRoll", "RHipPitch",
+        "RKneePitch", "RAnklePitch", "RAnkleRoll",
+        "RShoulderPitch", "RShoulderRoll", "RElbowYaw", "RElbowRoll",
+        "RWristYaw", "RHand",
+    ]
+
+    # Foot pressure sensor keys
+    FOOT_SENSORS = [
+        "Device/SubDeviceList/LFoot/FSR/FrontLeft/Sensor/Value",
+        "Device/SubDeviceList/LFoot/FSR/RearLeft/Sensor/Value",
+        "Device/SubDeviceList/RFoot/FSR/FrontRight/Sensor/Value",
+        "Device/SubDeviceList/RFoot/FSR/RearRight/Sensor/Value",
+    ]
+
     def __init__(self, robot_ip, robot_port):
         self.running = False
         self.thread = None
@@ -361,6 +547,7 @@ class MLDataLogger(object):
         self.video_client_name = ""
         self.video_device = None
         self.current_telemetry = {}
+        self._csv_initialized = False
 
         try:
             os.makedirs(self.out_dir)
@@ -398,57 +585,78 @@ class MLDataLogger(object):
             except Exception:
                 pass
 
-    # CSV columns for ML training
-    CSV_HEADER = (
-        "timestamp,state,ball_valid,ball_bx,ball_by,ball_bsz,ball_dist,"
-        "ball_vx,ball_vy,ball_pred_bx,ball_pred_by,ball_confidence,"
-        "head_yaw,inertial_roll,inertial_pitch,kicks,battery_pct\n"
-    )
-
     def update_telemetry(self, snapshot):
         with self.lock:
             self.current_telemetry = snapshot.copy()
 
+    def _get_csv_columns(self):
+        """Return ordered list of all CSV column names."""
+        cols = [
+            # Timestamp + FSM
+            "timestamp", "state", "time_in_state",
+            # Ball perception
+            "ball_valid", "ball_bx", "ball_by", "ball_bsz", "ball_dist",
+            "ball_vx", "ball_vy", "ball_pred_bx", "ball_pred_by",
+            "ball_confidence",
+            # IMU: angles
+            "imu_roll", "imu_pitch",
+            # IMU: gyroscope
+            "gyro_x", "gyro_y",
+            # IMU: accelerometer
+            "accel_x", "accel_y", "accel_z",
+            # Stability controller
+            "stab_score", "stab_speed_mult", "stab_tilt_mag",
+            "stab_gyro_mag", "stab_gyro_x", "stab_gyro_y",
+            "stab_unstable", "stab_fall_count", "stab_wobbles",
+            # Walk command
+            "walk_speed_x", "walk_speed_y", "walk_speed_theta",
+            # Foot pressure
+            "foot_lf", "foot_lb", "foot_rf", "foot_rb",
+            # Sonar
+            "sonar_left", "sonar_right",
+            # System
+            "battery_pct", "max_motor_temp", "kicks", "goals",
+            "goal_bearing", "goal_confidence",
+        ]
+        # Add all joint angles
+        for jn in self.JOINT_NAMES:
+            cols.append("j_" + jn)
+        return cols
+
     def _ensure_csv_header(self):
+        if self._csv_initialized:
+            return
         csv_path = self.out_dir + "game_log.csv"
         try:
             import os as _os
             if not _os.path.exists(csv_path):
+                cols = self._get_csv_columns()
                 with open(csv_path, "w") as f:
-                    f.write(MLDataLogger.CSV_HEADER)
+                    f.write(",".join(cols) + "\n")
         except Exception:
             pass
-        return csv_path
+        self._csv_initialized = True
 
     def log_game_state(self, t):
-        """Append one structured row to the game_log CSV for ML training.
+        """Append one comprehensive row to game_log.csv for ML training.
 
-        t must be a dict from TelemetryClient.current_data (already includes
-        ball_bx, ball_vx, etc.).  Called from BotFCBrain._run() each cycle.
+        t is a merged dict containing telemetry + stability + sensor data.
+        Called from BotFCBrain._run() each cycle (~20 Hz).
         """
         try:
+            if not self._csv_initialized:
+                self._ensure_csv_header()
             csv_path = self.out_dir + "game_log.csv"
-            row = "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n".format(
-                time.time(),
-                t.get("state",            "UNKNOWN"),
-                1 if t.get("ball_valid")  else 0,
-                t.get("ball_bx",          0.0),
-                t.get("ball_by",          0.0),
-                t.get("ball_bsz",         0.0),
-                t.get("ball_dist",        9.9),
-                t.get("ball_vx",          0.0),
-                t.get("ball_vy",          0.0),
-                t.get("ball_pred_bx",     0.0),
-                t.get("ball_pred_by",     0.0),
-                t.get("ball_confidence",  0.0),
-                t.get("head_yaw",         0.0),
-                t.get("inertial_roll",    0.0),
-                t.get("inertial_pitch",   0.0),
-                t.get("kicks",            0),
-                t.get("battery_pct",      -1),
-            )
+            cols = self._get_csv_columns()
+            vals = []
+            for c in cols:
+                v = t.get(c, 0.0)
+                if isinstance(v, float):
+                    vals.append("{:.5f}".format(v))
+                else:
+                    vals.append(str(v))
             with open(csv_path, "a") as f:
-                f.write(row)
+                f.write(",".join(vals) + "\n")
         except Exception:
             pass
 
@@ -483,13 +691,26 @@ class MLDataLogger(object):
 # CameraStreamer – JPEG frames via WS to server
 # ─────────────────────────────────────────────
 class CameraStreamer(object):
-    """Grabs JPEG frames from NAOqi and streams them to the server via
-    WebSocket /api/ws/bot_camera.  The server stores the latest frame and
-    relays it to browser clients on /api/ws/camera_feed.
+    """Grabs frames from NAOqi, encodes to JPEG, and streams them to the
+    server via WebSocket /api/ws/bot_camera.  The server relays to browser
+    clients on /api/ws/camera_feed.
 
-    Tries kJpegColorSpace=21 first; falls back to kRGBColorSpace=11 if
-    the firmware rejects it, encoding to JPEG via PIL.
+    Strategy
+    --------
+    1. Subscribe to the camera with BGR colorspace (13) — the most
+       reliable raw format across all NAO firmware versions.
+    2. Pull frames with getImageRemote().  img[6] is a raw byte string
+       of BGR pixels, NOT a standard image file.
+    3. Reconstruct the pixels into a NumPy array with
+       np.frombuffer(...).reshape(h, w, 3).
+    4. Encode to JPEG with cv2.imencode (preferred) or PIL.
+    5. Send the base64-encoded JPEG over WebSocket.
     """
+
+    # BGR colorspace is the most reliable for numpy/cv2 reconstruction.
+    _CAM_FMT = 13   # kBGRColorSpace
+    _CAM_RES = 1    # kQVGA (320x240)
+    _CAM_FPS = 5
 
     def __init__(self, robot_ip, robot_port, server_host, server_port):
         self.robot_ip    = robot_ip
@@ -500,11 +721,31 @@ class CameraStreamer(object):
         self.thread      = None
         self._vid        = None
         self._cam_client = ""
-        self._fmt        = STREAM_CAM_FORMAT  # 21=kJpeg, 11=kRGB
+        self._encoder    = None   # 'cv2', 'pil', or None
+
+    # ── Detect best JPEG encoder available on this system ────────────
+    @staticmethod
+    def _detect_encoder():
+        """Return 'cv2', 'pil', or None."""
+        try:
+            import cv2 as _cv2            # noqa: F401
+            return "cv2"
+        except ImportError:
+            pass
+        try:
+            from PIL import Image as _I   # noqa: F401
+            return "pil"
+        except ImportError:
+            pass
+        return None
 
     def start(self):
         if self.running:
             return
+
+        self._encoder = self._detect_encoder()
+        print("[CamStream] JPEG encoder: {}".format(self._encoder or "NONE"))
+
         try:
             self._vid = ALProxy("ALVideoDevice", self.robot_ip, self.robot_port)
         except Exception as e:
@@ -512,36 +753,51 @@ class CameraStreamer(object):
             return
 
         # Clean up any stale subscription from a previous crashed run
-        try:
-            self._vid.unsubscribe("BotFC_Stream")
-        except Exception:
-            pass
+        for old in ("BotFC_Stream", "BotFC_Stream_0", "BotFC_Stream_1"):
+            try:
+                self._vid.unsubscribe(old)
+            except Exception:
+                pass
 
-        # Try kJpegColorSpace first, fall back to kRGBColorSpace
+        # If we have no encoder, try kJpegColorSpace (21) so NAOqi
+        # encodes the frame for us.  Otherwise use BGR (13).
+        if self._encoder:
+            fmt, label = self._CAM_FMT, "kBGR"
+        else:
+            fmt, label = 21, "kJpeg (no local encoder)"
+
         handle = None
-        for fmt, label in ((21, "kJpeg"), (11, "kRGB")):
+        try:
+            handle = self._vid.subscribeCamera(
+                "BotFC_Stream", STREAM_CAM_ID, self._CAM_RES,
+                fmt, self._CAM_FPS)
+        except Exception as e1:
+            print("[CamStream] subscribeCamera fmt={} failed: {}".format(fmt, e1))
+            # Fallback: try the other format
+            alt_fmt = 21 if fmt != 21 else 13
             try:
                 handle = self._vid.subscribeCamera(
-                    "BotFC_Stream", STREAM_CAM_ID, STREAM_CAM_RES,
-                    fmt, STREAM_CAM_FPS)
-                if handle:
-                    self._fmt = fmt
-                    print("[CamStream] subscribeCamera OK with {} (fmt={})".format(label, fmt))
-                    break
-            except Exception as sub_e:
-                print("[CamStream] subscribeCamera fmt={} failed: {}".format(fmt, sub_e))
+                    "BotFC_Stream", STREAM_CAM_ID, self._CAM_RES,
+                    alt_fmt, self._CAM_FPS)
+                fmt = alt_fmt
+            except Exception as e2:
+                print("[CamStream] Fallback subscribeCamera also failed: {}".format(e2))
 
         if not handle:
             print("[CamStream] Could not subscribe to camera – aborting.")
             return
 
+        self._fmt = fmt
         self._cam_client = handle
+        print("[CamStream] subscribed OK: handle={}, fmt={} ({})".format(
+            handle, fmt, label))
+
         self.running = True
         self.thread  = threading.Thread(target=self._loop)
         self.thread.daemon = True
         self.thread.start()
-        print("[CamStream] Started stream to {}:{}.".format(
-            self.server_host, self.server_port))
+        print("[CamStream] Streaming to {}:{} at {} fps.".format(
+            self.server_host, self.server_port, self._CAM_FPS))
 
     def stop(self):
         self.running = False
@@ -553,32 +809,75 @@ class CameraStreamer(object):
             except Exception:
                 pass
 
-    def _to_jpeg(self, img):
-        """Return (jpg_bytes_as_str, w, h) or (None, 0, 0) on bad frame."""
-        if not img or len(img) <= 6:
-            return None, 0, 0
-        w, h, raw = int(img[0]), int(img[1]), img[6]
-        if not raw:
-            return None, w, h
-        if self._fmt == 21:   # kJpegColorSpace: img[6] is already JPEG bytes
-            jpg = bytes(bytearray(raw))
-            ba = bytearray(jpg)
-            if len(ba) < 3 or ba[0] != 0xff or ba[1] != 0xd8:
-                return None, w, h   # corrupt frame
-            return jpg, w, h
-        # kRGBColorSpace (11): encode via PIL
-        try:
-            import StringIO as _sio
-            from PIL import Image as _Img
-            rgb     = bytes(bytearray(raw))
-            pil_img = _Img.frombytes("RGB", (w, h), rgb)
-            buf     = _sio.StringIO()
-            pil_img.save(buf, format="JPEG", quality=70)
-            return buf.getvalue(), w, h
-        except Exception as enc_e:
-            print("[CamStream] PIL encode error: {}".format(enc_e))
-            return None, w, h
+    # ── Frame → JPEG conversion ──────────────────────────────────────
+    def _to_jpeg(self, nao_image):
+        """Convert a NAOqi getImageRemote() result to JPEG bytes.
 
+        Returns (jpeg_bytes, width, height) or (None, 0, 0) on failure.
+        """
+        if not nao_image or len(nao_image) <= 6:
+            return None, 0, 0
+
+        width    = int(nao_image[0])
+        height   = int(nao_image[1])
+        raw_data = nao_image[6]
+
+        if not raw_data:
+            return None, width, height
+
+        # ── kJpegColorSpace (21): raw_data is already JPEG ───────────
+        if self._fmt == 21:
+            jpg = bytearray(raw_data)
+            if len(jpg) < 3 or jpg[0] != 0xFF or jpg[1] != 0xD8:
+                return None, width, height   # corrupt / not JPEG
+            return bytes(jpg), width, height
+
+        # ── Raw pixel format (BGR=13 / RGB=11): reconstruct with numpy
+        try:
+            import numpy as np
+            # Convert the raw byte string into a flat uint8 array,
+            # then reshape into (height, width, channels).
+            arr = np.frombuffer(bytearray(raw_data), dtype=np.uint8)
+            expected = width * height * 3
+            if arr.size != expected:
+                return None, width, height
+            arr = arr.reshape((height, width, 3))
+        except Exception as e:
+            print("[CamStream] numpy reshape failed: {}".format(e))
+            return None, width, height
+
+        # ── Encode to JPEG ───────────────────────────────────────────
+        # Prefer cv2 (fast, C-level); fall back to PIL.
+        if self._encoder == "cv2":
+            try:
+                import cv2
+                # cv2.imencode expects BGR, which is what fmt=13 gives us.
+                if self._fmt == 11:          # RGB → BGR for cv2
+                    arr = arr[:, :, ::-1]
+                ok, buf = cv2.imencode(".jpg", arr,
+                                       [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    return bytes(bytearray(buf)), width, height
+            except Exception as e:
+                print("[CamStream] cv2 encode error: {}".format(e))
+
+        if self._encoder == "pil":
+            try:
+                from PIL import Image
+                import io
+                # PIL expects RGB
+                if self._fmt == 13:          # BGR → RGB for PIL
+                    arr = arr[:, :, ::-1]
+                pil_img = Image.fromarray(arr, "RGB")
+                buf = io.BytesIO()
+                pil_img.save(buf, format="JPEG", quality=70)
+                return buf.getvalue(), width, height
+            except Exception as e:
+                print("[CamStream] PIL encode error: {}".format(e))
+
+        return None, width, height
+
+    # ── WebSocket streaming loop ─────────────────────────────────────
     def _loop(self):
         import socket as _socket
         import base64 as _b64
@@ -590,7 +889,8 @@ class CameraStreamer(object):
             try:
                 sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
                 sock.settimeout(5)
-                print("[CamStream] Connecting to {}:{}...".format(self.server_host, self.server_port))
+                print("[CamStream] Connecting to {}:{}...".format(
+                    self.server_host, self.server_port))
                 sock.connect((self.server_host, self.server_port))
 
                 ws_key = _b64.b64encode(os.urandom(16))
@@ -601,9 +901,10 @@ class CameraStreamer(object):
                     "Connection: Upgrade\r\n"
                     "Sec-WebSocket-Key: {key}\r\n"
                     "Sec-WebSocket-Version: 13\r\n"
-                    "User-Agent: BotFC-CamStream-v1\r\n"
+                    "User-Agent: BotFC-CamStream-v2\r\n"
                     "\r\n"
-                ).format(host=self.server_host, port=self.server_port, key=ws_key)
+                ).format(host=self.server_host, port=self.server_port,
+                         key=ws_key)
                 sock.sendall(handshake.encode("utf-8"))
 
                 resp = b""
@@ -613,32 +914,45 @@ class CameraStreamer(object):
                         raise Exception("Handshake failed: no response")
                     resp += chunk
 
-                resp_lines = resp.split(b"\r\n")
-                if resp_lines and b"101" not in resp_lines[0]:
-                    raise Exception("WS upgrade failed: " + repr(resp_lines[0][:100]))
+                first_line = resp.split(b"\r\n")[0] if resp else b""
+                if b"101" not in first_line:
+                    raise Exception("WS upgrade rejected: " + repr(first_line))
 
-                print("[CamStream] Connected (handshake OK).")
-                sock.settimeout(None)  # Remove timeout for streaming
+                print("[CamStream] WebSocket connected.")
+                sock.settimeout(None)
                 bad_frames = 0
-                interval = 1.0 / STREAM_CAM_FPS
+                interval = 1.0 / self._CAM_FPS
 
                 while self.running:
                     t0 = time.time()
-                    img = self._vid.getImageRemote(self._cam_client)
-                    jpg, w, h = self._to_jpeg(img)
+                    try:
+                        nao_img = self._vid.getImageRemote(self._cam_client)
+                    except Exception as ge:
+                        print("[CamStream] getImageRemote error: {}".format(ge))
+                        nao_img = None
+
+                    jpg, w, h = self._to_jpeg(nao_img)
+
                     if jpg:
-                        b64 = _b64.b64encode(jpg).decode("ascii")
-                        payload = json.dumps({"type": "frame", "w": w, "h": h, "jpg": b64})
+                        b64 = _b64.b64encode(jpg)
+                        # Python 2: b64 is already str; Python 3: decode
+                        if not isinstance(b64, str):
+                            b64 = b64.decode("ascii")
+                        payload = json.dumps({
+                            "type": "frame", "w": w, "h": h, "jpg": b64})
                         TelemetryClient._ws_send(sock, payload)
                         bad_frames = 0
                     else:
                         bad_frames += 1
                         if bad_frames % 20 == 1:
-                            print("[CamStream] {} bad/empty frames so far".format(bad_frames))
+                            print("[CamStream] {} bad/empty frames".format(
+                                bad_frames))
+
                     try:
                         self._vid.releaseImage(self._cam_client)
                     except Exception:
                         pass
+
                     elapsed = time.time() - t0
                     remaining = interval - elapsed
                     if remaining > 0:
@@ -649,7 +963,9 @@ class CameraStreamer(object):
                 except Exception:
                     pass
             except Exception as e:
-                print("[CamStream] Error: {}. Retry in 3s...".format(e))
+                err = str(e)
+                if "Broken pipe" not in err and "EPIPE" not in err:
+                    print("[CamStream] Error: {}. Retry in 3s...".format(e))
             finally:
                 if sock:
                     try:
@@ -738,6 +1054,7 @@ class BotFCBrain(object):
         self.lock              = threading.Lock()
         self.running           = False
         self.kick_count        = 0
+        self.goal_count        = 0
         self.overheat_count    = 0
         self.break_remaining   = 0
         self.origin_x          = 0.0
@@ -748,8 +1065,16 @@ class BotFCBrain(object):
         self.last_overheat_time= 0.0
         self.search_yaw        = 0.0
         self.search_yaw_dir    = 1.0
+        self.search_sweeps     = 0
         self.field_map         = {}
         self.fsm_thread        = None
+        self._state_enter_time = 0.0   # when current state was entered
+        self._last_walk_cmd    = (0.0, 0.0, 0.0)  # (x, y, theta) for ML logging
+
+        # Goal awareness
+        self.goal_bearing      = DEFAULT_GOAL_BEARING
+        self.goal_last_seen    = 0.0   # time.time() of last goal detection
+        self.goal_confidence   = 0.0   # 0-1, decays when not seen
 
         # Ball perception
         self._last_ball_ts     = None     # NAOqi timestamp guard (stale detection)
@@ -758,6 +1083,9 @@ class BotFCBrain(object):
         # Bottom camera
         self._vid              = None     # ALVideoDevice proxy
         self._bot_cam_client   = ""       # subscription name
+
+        # Stability controller
+        self.stability = StabilityController()
 
         # Subsystems
         self.telemetry_client = TelemetryClient(server_ip, server_port)
@@ -782,13 +1110,10 @@ class BotFCBrain(object):
             "Device/SubDeviceList/RKneePitch/Temperature/Sensor/Value",
         ]
 
-    # ─── Posture / fall helpers ──────────────
-    def _read_inertial(self):
-        """Return (roll_rad, pitch_rad) from the inertial sensor unit.
+    # ─── Sensor helpers (for stability + ML) ──────────────
 
-        AngleX ≈ roll (lean left/right), AngleY ≈ pitch (lean forward/back).
-        Returns (0, 0) if the sensor is unavailable.
-        """
+    def _read_inertial(self):
+        """Return (roll_rad, pitch_rad) from the inertial sensor unit."""
         try:
             roll  = float(self.memory.getData(
                 "Device/SubDeviceList/InertialSensor/AngleX/Sensor/Value"))
@@ -798,17 +1123,161 @@ class BotFCBrain(object):
         except Exception:
             return (0.0, 0.0)
 
+    def _read_gyro(self):
+        """Return (gx, gy) angular velocity in rad/s from gyroscope."""
+        try:
+            gx = float(self.memory.getData(
+                "Device/SubDeviceList/InertialSensor/GyroscopeX/Sensor/Value"))
+            gy = float(self.memory.getData(
+                "Device/SubDeviceList/InertialSensor/GyroscopeY/Sensor/Value"))
+            return (gx, gy)
+        except Exception:
+            return (0.0, 0.0)
+
+    def _read_accel(self):
+        """Return (ax, ay, az) acceleration in m/s² from accelerometer."""
+        try:
+            ax = float(self.memory.getData(
+                "Device/SubDeviceList/InertialSensor/AccelerometerX/Sensor/Value"))
+            ay = float(self.memory.getData(
+                "Device/SubDeviceList/InertialSensor/AccelerometerY/Sensor/Value"))
+            az = float(self.memory.getData(
+                "Device/SubDeviceList/InertialSensor/AccelerometerZ/Sensor/Value"))
+            return (ax, ay, az)
+        except Exception:
+            return (0.0, 0.0, 9.81)
+
+    def _read_foot_pressure(self):
+        """Return (lf, lb, rf, rb) foot pressure sensor values."""
+        try:
+            vals = [float(self.memory.getData(k))
+                    for k in MLDataLogger.FOOT_SENSORS]
+            return tuple(vals)
+        except Exception:
+            return (0.0, 0.0, 0.0, 0.0)
+
+    def _read_joint_angles(self):
+        """Return dict of all joint angles {name: radians}."""
+        result = {}
+        try:
+            angles = self.motion.getAngles("Body", False)
+            for i, name in enumerate(MLDataLogger.JOINT_NAMES):
+                if i < len(angles):
+                    result["j_" + name] = round(float(angles[i]), 4)
+                else:
+                    result["j_" + name] = 0.0
+        except Exception:
+            for name in MLDataLogger.JOINT_NAMES:
+                result["j_" + name] = 0.0
+        return result
+
+    def _read_max_motor_temp(self):
+        """Return the hottest motor temperature."""
+        try:
+            temps = [float(self.memory.getData(k)) for k in self.temp_keys]
+            return max(temps) if temps else 0.0
+        except Exception:
+            return 0.0
+
     def _is_fallen(self):
         """Return True if the inertial sensor shows the robot is no longer upright.
 
-        Thresholds (radians):
-          |roll|  > 0.55 rad (~31°) → sideways fall
-          |pitch| > 0.80 rad (~46°) → forward/backward fall
-        These are conservative: even a strong lean will trigger recovery before
-        the robot has fully toppled.
+        Uses BOTH angle and gyro rate for faster detection.
         """
         roll, pitch = self._read_inertial()
-        return abs(roll) > 0.55 or abs(pitch) > 0.80
+        gx, gy = self._read_gyro()
+
+        # Angle-based: severe tilt
+        if abs(roll) > 0.55 or abs(pitch) > 0.80:
+            return True
+
+        # Rate-based: if tilting fast AND already leaning, about to fall
+        if (abs(roll) > 0.35 and abs(gx) > 2.5) or \
+           (abs(pitch) > 0.50 and abs(gy) > 2.5):
+            return True
+
+        return False
+
+    # ─── Sonar helper ───────────────────────────
+    def _read_sonar(self):
+        """Read left and right sonar distance (metres). Returns (sl, sr)."""
+        try:
+            sl = float(self.memory.getData(
+                "Device/SubDeviceList/US/Left/Sensor/Value"))
+            sr = float(self.memory.getData(
+                "Device/SubDeviceList/US/Right/Sensor/Value"))
+            return sl, sr
+        except Exception:
+            return 9.0, 9.0
+
+    # ─── Obstacle avoidance constants ─────────
+    OBSTACLE_DANGER  = 0.25   # metres — very close, hard brake + curve
+    OBSTACLE_CAUTION = 0.50   # metres — start curving around
+    OBSTACLE_NOTICE  = 0.80   # metres — mild avoidance bias
+
+    def _stable_walk(self, speed_x, speed_y, speed_theta):
+        """Wrapper around moveToward with stability + obstacle avoidance.
+
+        All FSM states should call this instead of self.motion.moveToward()
+        to get:
+          1. Adaptive speed reduction from StabilityController
+          2. Sonar-based obstacle avoidance (curves around walls/robots)
+        """
+        sm = self.stability.speed_mult
+
+        # ── Obstacle avoidance via sonar ──────────────────────────────
+        sl, sr = self._read_sonar()
+        self._sonar_left  = sl
+        self._sonar_right = sr
+        min_dist = min(sl, sr)
+
+        avoid_turn = 0.0
+        avoid_lat  = 0.0
+        speed_cap  = 1.0      # fraction cap on forward speed
+
+        if min_dist < self.OBSTACLE_DANGER:
+            # Very close — strong avoidance
+            if sl < sr:
+                avoid_turn = -0.5    # hard turn right
+                avoid_lat  = -0.08   # strafe right
+            else:
+                avoid_turn = 0.5     # hard turn left
+                avoid_lat  = 0.08    # strafe left
+            speed_cap = 0.3          # crawl forward
+
+        elif min_dist < self.OBSTACLE_CAUTION:
+            # Moderate distance — gentle curve
+            closeness = 1.0 - (min_dist - self.OBSTACLE_DANGER) / \
+                        (self.OBSTACLE_CAUTION - self.OBSTACLE_DANGER)
+            if sl < sr:
+                avoid_turn = -0.30 * closeness
+                avoid_lat  = -0.05 * closeness
+            else:
+                avoid_turn = 0.30 * closeness
+                avoid_lat  = 0.05 * closeness
+            speed_cap = 0.5 + 0.5 * (1.0 - closeness)
+
+        elif min_dist < self.OBSTACLE_NOTICE:
+            # Far but noticed — slight bias
+            closeness = 1.0 - (min_dist - self.OBSTACLE_CAUTION) / \
+                        (self.OBSTACLE_NOTICE - self.OBSTACLE_CAUTION)
+            if sl < sr:
+                avoid_turn = -0.12 * closeness
+            else:
+                avoid_turn = 0.12 * closeness
+
+        # ── Apply stability multiplier ────────────────────────────────
+        adj_x     = speed_x * sm * speed_cap
+        adj_y     = (speed_y + avoid_lat) * sm
+        adj_theta = (speed_theta + avoid_turn) * min(1.0, sm + 0.2)
+
+        # Clamp final commands to safe range
+        adj_x     = max(-0.5, min(1.0, adj_x))
+        adj_y     = max(-0.4, min(0.4, adj_y))
+        adj_theta = max(-0.8, min(0.8, adj_theta))
+
+        self._last_walk_cmd = (adj_x, adj_y, adj_theta)
+        self.motion.moveToward(adj_x, adj_y, adj_theta)
 
     def _ensure_standing(self, max_attempts=3):
         """Bring the robot to StandInit from any starting posture.
@@ -1026,9 +1495,6 @@ class BotFCBrain(object):
     def _run(self):
         while self.running:
             # ── Server command override ────────────────────────────────────
-            # The C++ server (or frontend operator) can push commands via
-            # POST /api/command.  We honour them here, before the kill switch,
-            # so the operator always has full authority.
             srv_cmd = self.command_poller.get_and_clear()
             if srv_cmd:
                 if srv_cmd == "STOP":
@@ -1051,7 +1517,6 @@ class BotFCBrain(object):
                     self.tts.post.say("Stopping.")
                 except Exception:
                     pass
-                # Wait until touch is released before resuming
                 while self.running and self._check_kill_switch():
                     time.sleep(0.2)
                 if self.running:
@@ -1060,15 +1525,31 @@ class BotFCBrain(object):
                         self.state = STATE_SEARCH
                 continue
 
+            # ══════════════════════════════════════════════════════════════
+            # SENSOR SNAPSHOT — read all sensors ONCE per cycle for
+            # stability, ML logging, and FSM decisions.
+            # ══════════════════════════════════════════════════════════════
+            roll, pitch = self._read_inertial()
+            gx, gy      = self._read_gyro()
+            ax, ay, az  = self._read_accel()
+            foot_lf, foot_lb, foot_rf, foot_rb = self._read_foot_pressure()
+            joint_angles = self._read_joint_angles()
+            max_temp     = self._read_max_motor_temp()
+
+            # ── Update stability controller ────────────────────────────────
+            self.stability.update(roll, pitch, gx, gy)
+
             # ── Fall recovery (mid-match) ──────────────────────────────────
             if self._is_fallen():
                 self.motion.stopMove()
-                self.ball_model.valid = False   # invalidate stale ball data
+                self.ball_model.valid = False
+                self.stability.record_fall()
                 try:
                     self.leds.fadeRGB("AllLeds", 0xFF6600, 0.1)
                 except Exception:
                     pass
-                print("[BotFC] Fall detected – attempting recovery.")
+                print("[BotFC] Fall detected (#{}) – recovery.".format(
+                    self.stability.fall_count))
                 self._ensure_standing(max_attempts=3)
                 try:
                     self.leds.fadeRGB("AllLeds", 0x00FF00, 0.2)
@@ -1076,20 +1557,22 @@ class BotFCBrain(object):
                     pass
                 with self.lock:
                     self.state = STATE_SEARCH
+                    self._state_enter_time = time.time()
                 continue
 
             self._safety_check()
-
-            # Tick the ball model: expire data older than BALL_LOSS_TIME
             self.ball_model.tick()
 
             with self.lock:
-                s  = self.state
-                k  = self.kick_count
-                br = self.break_remaining
-                lbt= self.last_ball_time
+                s   = self.state
+                k   = self.kick_count
+                gc  = self.goal_count
+                br  = self.break_remaining
+                lbt = self.last_ball_time
+                s_enter = self._state_enter_time
 
             ball_age = self.ball_model.age()
+            time_in_state = time.time() - s_enter if s_enter > 0 else 0.0
 
             # Battery
             bat = -1
@@ -1099,52 +1582,110 @@ class BotFCBrain(object):
             except Exception:
                 pass
 
-            # Head yaw & inertial sensors for telemetry
+            # Sonar
+            sonar_l = sonar_r = 9.0
+            try:
+                sonar_l = float(self.memory.getData(
+                    "Device/SubDeviceList/US/Left/Sensor/Value"))
+                sonar_r = float(self.memory.getData(
+                    "Device/SubDeviceList/US/Right/Sensor/Value"))
+            except Exception:
+                pass
+
+            # Head yaw
             h_yaw = 0.0
             try:
                 h_yaw = self.motion.getAngles("HeadYaw", False)[0]
             except Exception:
                 pass
-            roll, pitch = self._read_inertial()
 
+            # ── Build comprehensive telemetry snapshot ─────────────────────
             bm = self.ball_model
-            self.telemetry_client.update(
-                state=s, kicks=k,
-                ball_age=round(ball_age, 2),
-                break_remaining=br,
-                battery_pct=bat,
-                # Ball state
-                ball_valid=bm.valid,
-                ball_bx=round(bm.bx,  3), ball_by=round(bm.by,  3),
-                ball_bsz=round(bm.bsz, 4),
-                ball_dist=round(bm.dist, 2),
-                ball_vx=round(bm.vbx, 3),  ball_vy=round(bm.vby, 3),
-                ball_pred_bx=round(bm.pred_bx, 3),
-                ball_pred_by=round(bm.pred_by, 3),
-                ball_confidence=round(bm.confidence, 2),
-                # Robot pose
-                head_yaw=round(h_yaw, 3),
-                inertial_roll=round(roll,  3),
-                inertial_pitch=round(pitch, 3),
-            )
+            stab_ml = self.stability.get_ml_dict()
+            wcx, wcy, wct = self._last_walk_cmd
 
-            # Log game state for ML training (every cycle = ~20 Hz)
-            with self.telemetry_client.lock:
-                telem_snap = self.telemetry_client.current_data.copy()
-            self.data_logger.update_telemetry(telem_snap)
-            self.data_logger.log_game_state(telem_snap)
+            telem = {
+                # Timestamp + FSM
+                "timestamp":       round(time.time(), 3),
+                "state":           s,
+                "time_in_state":   round(time_in_state, 2),
+                # Ball
+                "ball_valid":      1 if bm.valid else 0,
+                "ball_bx":         round(bm.bx,  3),
+                "ball_by":         round(bm.by,  3),
+                "ball_bsz":        round(bm.bsz, 4),
+                "ball_dist":       round(bm.dist, 2),
+                "ball_vx":         round(bm.vbx, 3),
+                "ball_vy":         round(bm.vby, 3),
+                "ball_pred_bx":    round(bm.pred_bx, 3),
+                "ball_pred_by":    round(bm.pred_by, 3),
+                "ball_confidence": round(bm.confidence, 2),
+                # IMU
+                "imu_roll":        round(roll,  4),
+                "imu_pitch":       round(pitch, 4),
+                "gyro_x":          round(gx, 4),
+                "gyro_y":          round(gy, 4),
+                "accel_x":         round(ax, 4),
+                "accel_y":         round(ay, 4),
+                "accel_z":         round(az, 4),
+                # Walk command
+                "walk_speed_x":    round(wcx, 3),
+                "walk_speed_y":    round(wcy, 3),
+                "walk_speed_theta":round(wct, 3),
+                # Foot pressure
+                "foot_lf":         round(foot_lf, 3),
+                "foot_lb":         round(foot_lb, 3),
+                "foot_rf":         round(foot_rf, 3),
+                "foot_rb":         round(foot_rb, 3),
+                # Sonar
+                "sonar_left":      round(sonar_l, 3),
+                "sonar_right":     round(sonar_r, 3),
+                # System
+                "battery_pct":     bat,
+                "max_motor_temp":  round(max_temp, 1),
+                "kicks":           k,
+                "goals":           gc,
+                "goal_bearing":    round(self.goal_bearing, 3),
+                "goal_confidence": round(self.goal_confidence, 2),
+                # Legacy keys (for telemetry WS)
+                "ball_age":        round(ball_age, 2),
+                "break_remaining": br,
+                "head_yaw":        round(h_yaw, 3),
+                "inertial_roll":   round(roll, 3),
+                "inertial_pitch":  round(pitch, 3),
+            }
+            # Merge stability
+            telem.update(stab_ml)
+            # Merge joint angles
+            telem.update(joint_angles)
+
+            # Push to websocket telemetry + ML logger
+            self.telemetry_client.update(**telem)
+            self.data_logger.update_telemetry(telem)
+            self.data_logger.log_game_state(telem)
 
             if s != STATE_HALFTIME:
                 self._enforce_bounds()
+                self._update_goal_confidence()
 
-                if   s == STATE_SEARCH:   self._do_search()
-                elif s == STATE_APPROACH: self._do_approach()
-                elif s == STATE_ALIGN:    self._do_align()
-                elif s == STATE_KICK:     self._do_kick()
-                elif s == STATE_TACKLE:   self._do_tackle()
+                if s in (STATE_SEARCH, STATE_APPROACH):
+                    self._detect_goal_posts()
+
+                prev_state = s
+                if   s == STATE_SEARCH:    self._do_search()
+                elif s == STATE_APPROACH:  self._do_approach()
+                elif s == STATE_ALIGN:     self._do_align()
+                elif s == STATE_KICK:      self._do_kick()
+                elif s == STATE_TACKLE:    self._do_tackle()
+                elif s == STATE_CELEBRATE: self._do_celebrate()
                 else:
                     with self.lock:
                         self.state = STATE_SEARCH
+
+                # Track state transitions for time_in_state
+                with self.lock:
+                    if self.state != prev_state:
+                        self._state_enter_time = time.time()
 
             time.sleep(0.05)
 
@@ -1153,7 +1694,7 @@ class BotFCBrain(object):
     def _read_ball(self):
         """Return (bx, by, bsz) from ALRedBallDetection if the timestamp is NEW.
 
-        NAOqi never clears redBallDetected when the ball leaves view – it just
+        NAOqi never clears redBallDetected when the ball leaves view — it just
         stops advancing the timestamp.  Comparing consecutive timestamps is the
         only reliable way to distinguish a live detection from stale cache.
         """
@@ -1167,6 +1708,29 @@ class BotFCBrain(object):
             self._last_ball_ts = ts     # new timestamp → live detection
             info = data[1]
             return (float(info[0]), float(info[1]), float(info[2]))
+        except Exception:
+            return None
+
+    def _read_ball_raw(self):
+        """Return (bx, by, bsz) from ALRedBallDetection WITHOUT the stale
+        timestamp guard.  Used for verification when we JUST saw the ball
+        and want to confirm it's still there (timestamps may not have
+        advanced yet within the same 33ms frame).
+
+        The data might be from the same frame, but that's fine for confirm.
+        """
+        try:
+            data = self.memory.getData("redBallDetected")
+            if not (data and len(data) >= 2):
+                return None
+            info = data[1]
+            bx  = float(info[0])
+            by  = float(info[1])
+            bsz = float(info[2])
+            # Sanity check: ball size must be positive and position reasonable.
+            if bsz <= 0.0 or abs(bx) > 1.0 or abs(by) > 1.0:
+                return None
+            return (bx, by, bsz)
         except Exception:
             return None
 
@@ -1215,6 +1779,236 @@ class BotFCBrain(object):
             return (cx, cy, sz)
         except Exception:
             return None
+
+    def _detect_goal_posts(self):
+        """Detect goal posts using multiple colour profiles for different
+        lighting conditions (bright yellow, dim yellow, white posts).
+
+        Scans through GOAL_POST_PROFILES and uses whichever profile finds
+        the most matching pixels above the minimum threshold.  Also checks
+        that the blob has a vertical shape (taller than it is wide) to
+        distinguish actual posts from floor markings or other yellow objects.
+
+        Returns a world-relative bearing to the goal, or None.
+        """
+        if not (self._vid and self._bot_cam_client):
+            return None
+        try:
+            img = self._vid.getImageRemote(self._bot_cam_client)
+            if not img or len(img) < 7:
+                return None
+            width  = int(img[0])
+            height = int(img[1])
+            pixels = bytearray(img[6])
+
+            # Only scan top 65% of frame.
+            scan_rows = int(height * 0.65)
+            stride = BOT_CAM_STRIDE * 3
+            max_offset = min(scan_rows * width * 3, len(pixels) - 2)
+
+            best_count  = 0
+            best_bx_sum = 0
+            best_y_min  = height
+            best_y_max  = 0
+            best_label  = ""
+
+            for prof in GOAL_POST_PROFILES:
+                p_r_min, p_g_min, p_b_max, p_diff, p_label = prof
+                bx_sum = count = 0
+                y_min = height
+                y_max = 0
+
+                for off in range(0, max_offset, stride):
+                    b = pixels[off]
+                    g = pixels[off + 1]
+                    r = pixels[off + 2]
+
+                    match = False
+                    if p_diff >= 0:
+                        # Coloured post (yellow): R/G high, B low.
+                        if (r > p_r_min and g > p_g_min
+                                and b < p_b_max
+                                and min(r, g) - b > p_diff):
+                            match = True
+                    else:
+                        # White post: all channels high and close together.
+                        if (r > p_r_min and g > p_g_min
+                                and b > 170
+                                and abs(r - g) < 35 and abs(r - b) < 35):
+                            match = True
+
+                    if match:
+                        px = (off // 3) % width
+                        py = (off // 3) // width
+                        bx_sum += px
+                        if py < y_min:
+                            y_min = py
+                        if py > y_max:
+                            y_max = py
+                        count += 1
+
+                if count > best_count:
+                    best_count  = count
+                    best_bx_sum = bx_sum
+                    best_y_min  = y_min
+                    best_y_max  = y_max
+                    best_label  = p_label
+
+            self._vid.releaseImage(self._bot_cam_client)
+
+            if best_count < GOAL_POST_MIN_PX:
+                return None
+
+            # Shape check: blob must be vertically tall (goal posts are vertical).
+            blob_height = best_y_max - best_y_min
+            if blob_height < height * GOAL_POST_MIN_HEIGHT_RATIO:
+                return None  # too flat — probably floor marking or noise
+
+            # Centroid x, normalised to [-0.5, 0.5]
+            goal_cx = (float(best_bx_sum) / best_count - width * 0.5) / width
+
+            # NAO top camera HFOV ≈ 60.9° = 1.064 rad
+            cam_bearing = goal_cx * 1.064
+
+            head_yaw = 0.0
+            try:
+                head_yaw = self.motion.getAngles("HeadYaw", False)[0]
+            except Exception:
+                pass
+
+            world_bearing = head_yaw - cam_bearing
+
+            # EMA smoothing.
+            now = time.time()
+            alpha = 0.4 if (now - self.goal_last_seen) < 2.0 else 0.8
+            self.goal_bearing = alpha * world_bearing + (1.0 - alpha) * self.goal_bearing
+            self.goal_last_seen = now
+            self.goal_confidence = min(1.0, self.goal_confidence + 0.15)
+
+            return world_bearing
+        except Exception:
+            return None
+
+    def _update_goal_confidence(self):
+        """Decay goal confidence when not recently seen."""
+        age = time.time() - self.goal_last_seen
+        if age > 3.0:
+            self.goal_confidence = max(0.0, self.goal_confidence - 0.02)
+        if age > 10.0:
+            self.goal_bearing = self.goal_bearing * 0.95 + DEFAULT_GOAL_BEARING * 0.05
+
+    # ─── Goal scored detection ──────────────────
+    def _check_goal_scored(self):
+        """Check if the ball has disappeared after a kick (implying it went
+        into the goal).  Called right after the kick motion completes.
+
+        Strategy:
+        1. The ball was at the robot's feet and we kicked toward goal_bearing.
+        2. Look ahead in the kick direction for ~1 second.
+        3. If the ball is NOT detected in most samples → we scored!
+        4. If we still see the ball → it didn't go in (or went wide).
+
+        Returns True if a goal was likely scored.
+        """
+        # Wait for the ball to travel.
+        time.sleep(GOAL_CHECK_DELAY)
+
+        # Look in the kick direction.
+        self.motion.setAngles("HeadYaw",   0.0,  0.3)
+        self.motion.setAngles("HeadPitch", 0.20, 0.3)  # look slightly down/ahead
+        time.sleep(0.3)
+
+        ball_gone_count = 0
+        for _ in range(GOAL_CHECK_SAMPLES):
+            ball = self._read_ball()
+            if ball is None:
+                ball = self._detect_bottom_cam()
+            if ball is None:
+                ball_gone_count += 1
+            time.sleep(GOAL_CHECK_INTERVAL)
+
+        return ball_gone_count >= GOAL_BALL_GONE_THRESH
+
+    # ─── Celebration ───────────────────────────
+    def _do_celebrate(self):
+        """Full celebration routine when the robot scores a goal.
+
+        Sequence:
+        1. LED light show (cycling colours)
+        2. Victory speech
+        3. Arm raise animation
+        4. Optional spin/wiggle
+        5. Return to search
+        """
+        try:
+            self.motion.stopMove()
+
+            # ── LED light show ──────────────────────────────────────────
+            colours = [0x00FF00, 0xFFFF00, 0x00FFFF, 0xFF00FF, 0xFFFFFF]
+            for c in colours:
+                self.leds.fadeRGB("AllLeds", c, 0.15)
+                time.sleep(0.2)
+
+            # ── Victory speech ──────────────────────────────────────────
+            phrases = [
+                "Goal! What a strike!",
+                "Get in! Absolute banger!",
+                "Goal! I am the greatest footballer!",
+                "Yes! Nothing but net!",
+                "Golazo! Magnificent!",
+            ]
+            import random
+            phrase = random.choice(phrases)
+            self.tts.post.say(phrase)
+
+            # ── Arms up celebration ─────────────────────────────────────
+            self.posture.goToPosture("Stand", 0.8)
+            time.sleep(0.3)
+
+            # Raise both arms up (low ShoulderPitch = arms up)
+            self.motion.setAngles(
+                ["LShoulderPitch", "RShoulderPitch",
+                 "LShoulderRoll",  "RShoulderRoll",
+                 "LElbowYaw",      "RElbowYaw"],
+                [-1.0, -1.0,    # arms up
+                  0.3, -0.3,    # spread out
+                 -1.5,  1.5],   # elbows out
+                0.3
+            )
+            time.sleep(1.5)
+
+            # ── Victory wiggle ──────────────────────────────────────────
+            for _ in range(3):
+                self.motion.setAngles("HeadYaw",  0.4, 0.5)
+                time.sleep(0.2)
+                self.motion.setAngles("HeadYaw", -0.4, 0.5)
+                time.sleep(0.2)
+            self.motion.setAngles("HeadYaw", 0.0, 0.3)
+
+            # ── Second LED flash ────────────────────────────────────────
+            for _ in range(4):
+                self.leds.fadeRGB("AllLeds", 0x00FF00, 0.08)
+                time.sleep(0.15)
+                self.leds.fadeRGB("AllLeds", 0x000000, 0.08)
+                time.sleep(0.15)
+
+            # ── Spin move ───────────────────────────────────────────────
+            self.motion.setAngles(
+                ["LShoulderPitch", "RShoulderPitch"],
+                [1.5, 1.5], 0.3)  # arms back down
+            time.sleep(0.3)
+            self.posture.goToPosture("Stand", 0.8)
+            self.motion.moveTo(0.0, 0.0, 3.14)   # full spin!
+            time.sleep(0.5)
+
+            self.tts.post.say("Let's go again!")
+
+        except Exception:
+            pass
+
+        self.posture.goToPosture("StandInit", 0.8)
+        with self.lock:
+            self.state = STATE_SEARCH
 
     def _get_ball_and_update_model(self):
         """Query both cameras, update the BallModel if anything is found.
@@ -1360,76 +2154,108 @@ class BotFCBrain(object):
         ball = self._get_ball_and_update_model()
 
         if ball is not None:
-            # Freeze head at its current yaw so the next frame is taken with
-            # a stationary camera (eliminates motion-blur ghost detections).
-            try:
-                cy = self.motion.getAngles("HeadYaw", False)[0]
-                self.motion.setAngles("HeadYaw", cy, 0.3)
-            except Exception:
-                pass
-            time.sleep(0.08)
+            # First detection is real (passed the stale-timestamp guard).
+            # Quick verify: check bottom cam OR raw re-read to confirm.
+            # This is less strict than before — the stale guard already
+            # filtered out ghost data, so a single confirm is enough.
+            confirm = self._detect_bottom_cam()
+            if confirm is None:
+                confirm = self._read_ball_raw()  # re-read without stale guard
 
-            # Re-verify: a second fresh detection within 80 ms confirms the
-            # ball is truly visible (not a single-frame noise spike).
-            ball2 = self._get_ball_and_update_model()
-            if ball2 is not None:
+            if confirm is not None:
                 self.motion.stopMove()
                 with self.lock:
                     self.last_ball_time = time.time()
                     self.state = STATE_APPROACH
                 self.motion.setAngles("HeadPitch", 0.15, 0.2)
-                self.tts.post.say("Ball found!")
+                self.motion.setAngles("HeadYaw",   0.0,  0.3)
                 return
-            # Single-frame ghost: fall through and keep sweeping.
+            # Single camera only — still transition, but don't freeze head.
+            # The ball is probably real since _read_ball() passed the stale check.
+            self.motion.stopMove()
+            with self.lock:
+                self.last_ball_time = time.time()
+                self.state = STATE_APPROACH
+            return
+            # Fall through removed: first fresh detection is trusted.
 
         # ── Sweep with heading memory ──────────────────────────────────────
-        # On the first sweep cycle after losing the ball, seed the head yaw
-        # to the last known ball heading so we search there first.
         if (self.search_yaw == 0.0 and self.search_yaw_dir == 1.0
                 and self.ball_model.last_heading != 0.0):
-            seeded = max(-1.0, min(1.0, -self.ball_model.last_heading))
+            seeded = max(-1.0, min(1.0, self.ball_model.last_heading))
             self.search_yaw = seeded
 
-        # 0.06 rad/step at 50 ms/cycle ≈ 1.2 rad/s – slow enough for the
-        # camera to fire a detection event as the ball passes through the FOV.
-        self.search_yaw += self.search_yaw_dir * 0.06
+        self.search_yaw += self.search_yaw_dir * SEARCH_HEAD_SPEED
         if self.search_yaw >= 1.0:
-            self.search_yaw    = 1.0
+            self.search_yaw     = 1.0
             self.search_yaw_dir = -1.0
+            self.search_sweeps  = getattr(self, 'search_sweeps', 0) + 1
         elif self.search_yaw <= -1.0:
-            self.search_yaw    = -1.0
+            self.search_yaw     = -1.0
             self.search_yaw_dir = 1.0
+            self.search_sweeps  = getattr(self, 'search_sweeps', 0) + 1
 
-        self.motion.setAngles("HeadYaw",   self.search_yaw, 0.15)
-        # Pitch down enough to see the ball on the floor (~14° = 0.25 rad).
-        self.motion.setAngles("HeadPitch", 0.25, 0.15)
+        self.motion.setAngles("HeadYaw", self.search_yaw, 0.18)
 
+        # Alternate pitch: look down at ground nearby, then further out.
+        # This covers both close ball and far ball in the sweep.
+        sweeps = getattr(self, 'search_sweeps', 0)
+        if sweeps % 2 == 0:
+            self.motion.setAngles("HeadPitch", SEARCH_PITCH_LOW, 0.15)
+        else:
+            self.motion.setAngles("HeadPitch", SEARCH_PITCH_HIGH, 0.15)
+
+        # ── Body movement while searching ──────────────────────────────────
         with self.lock:
             ltime = self.last_ball_time
-        if time.time() - ltime > 15.0:
-            # Been searching a long time – rotate body slowly to cover ground.
-            self.motion.moveToward(0.0, 0.0, 0.2)
+        search_duration = time.time() - ltime
+
+        if search_duration > SEARCH_WALK_DELAY:
+            # Walk forward slowly while rotating to cover ground.
+            # Alternate rotation direction every 2 sweeps.
+            rot_dir = 0.25 if (sweeps // 2) % 2 == 0 else -0.25
+            self._stable_walk(0.3, 0.0, rot_dir)
         else:
+            # First few seconds: stand still and just scan with head.
             self.motion.stopMove()
 
     # ─── APPROACH ───────────────────────────
     def _do_approach(self):
         self._update_local_map()
         self.leds.fadeRGB("AllLeds", 0x00FF00, 0.15)
-        self.motion.setAngles("HeadPitch", 0.25, 0.3)
 
         now = time.time()
-        if now - self.last_man_on_time > 4.0:
-            self.tts.post.say("Man on, man on")
-            self.last_man_on_time = now
 
-        # Update model if a fresh reading exists.
-        self._get_ball_and_update_model()
+        # Update model — try top camera first, then bottom for close range.
+        ball = self._get_ball_and_update_model()
 
-        # KEY: only drop to SEARCH when the model itself expires (BALL_LOSS_TIME
-        # seconds of no detections).  A single missed camera frame is NOT enough
-        # to abort the approach – that's what caused the jittery search loops.
+        # When ball is getting close (bsz indicates nearness), also check
+        # bottom camera to prevent blind-spot loss.
+        if ball is None and self.ball_model.bsz > 0.06:
+            bot_ball = self._detect_bottom_cam()
+            if bot_ball is not None:
+                bx_b, by_b, bsz_b = bot_ball
+                try:
+                    head_yaw_b = self.motion.getAngles("HeadYaw", False)[0]
+                except Exception:
+                    head_yaw_b = 0.0
+                self.ball_model.update(bx_b, by_b, bsz_b, head_yaw_b)
+                ball = bot_ball
+
+        # If ball model is about to expire, try looking toward last heading.
+        if ball is None and self.ball_model.valid:
+            age = now - self.ball_model._last_update_t if self.ball_model._last_update_t else 99.0
+            if age > 0.8:
+                # Ball almost lost — snap head toward last known heading
+                # to try to recover it before the model expires.
+                recover_yaw = max(-0.8, min(0.8, -self.ball_model.last_heading))
+                self.motion.setAngles("HeadYaw", recover_yaw, 0.4)
+                self.motion.setAngles("HeadPitch", 0.35, 0.3)  # look down
+
+        # Only drop to SEARCH when the model itself expires (BALL_LOSS_TIME
+        # seconds of no detections).
         if not self.ball_model.valid:
+            self.motion.stopMove()
             with self.lock:
                 self.state = STATE_SEARCH
             return
@@ -1437,30 +2263,45 @@ class BotFCBrain(object):
         with self.lock:
             self.last_ball_time = now
 
-        bx  = self.ball_model.bx
-        bsz = self.ball_model.bsz
+        bx   = self.ball_model.bx
+        bsz  = self.ball_model.bsz
         dist = self.ball_model.dist
 
-        # ── Head tracking with ball-movement prediction ─────────────────────
-        # When confidence is high and the ball is moving fast, servo the head
-        # toward the PREDICTED position (BALL_PRED_HORIZON s ahead) instead of
-        # the current position.  This keeps the ball in frame even when it is
-        # rolling across the camera FOV.  At low confidence (just found ball)
-        # track the measured position to avoid overshooting.
+        # ── Head tracking: LOCK ON to the ball ─────────────────────────
+        # NAO convention: bx positive = ball right of camera center.
+        # HeadYaw positive = head turned LEFT.
+        # To look at ball on the RIGHT, HeadYaw must go NEGATIVE.
+        # So: desired_head_yaw = current_yaw - bx * gain
         head_yaw = 0.0
         try:
             head_yaw = self.motion.getAngles("HeadYaw", False)[0]
-            ball_moving = abs(self.ball_model.vbx) > BALL_VEL_THRESH
-            use_pred    = ball_moving and self.ball_model.confidence > 0.5
-            track_bx    = self.ball_model.pred_bx if use_pred else bx
-            # NAO: positive HeadYaw = head left. bx > 0 = ball right of frame.
-            target_yaw = max(-1.0, min(1.0, head_yaw - track_bx * HEAD_TRACK_GAIN))
-            self.motion.setAngles("HeadYaw", target_yaw, 0.4)
-            head_yaw = target_yaw
         except Exception:
             pass
 
-        # ── Sonar obstacle check ───────────────────────────────────────────
+        # Use prediction for fast-moving ball, raw bx otherwise
+        ball_moving = abs(self.ball_model.vbx) > BALL_VEL_THRESH
+        use_pred    = ball_moving and self.ball_model.confidence > 0.5
+        track_bx    = self.ball_model.pred_bx if use_pred else bx
+
+        # Direct head servo: move head toward the ball.
+        # Larger gain = more aggressive tracking = ball stays in view.
+        yaw_error = -track_bx * HEAD_TRACK_GAIN  # negative bx→positive yaw
+        new_head_yaw = head_yaw + yaw_error
+        new_head_yaw = max(-0.8, min(0.8, new_head_yaw))
+        self.motion.setAngles("HeadYaw", new_head_yaw, 0.35)
+
+        # Pitch: ALWAYS look down. Ball is on the ground.
+        # Positive HeadPitch = looking DOWN on NAO.
+        if bsz > 0.10:
+            pitch = 0.40 + min(0.12, (bsz - 0.10) * 3.0)  # 0.40→0.52
+        elif bsz > 0.04:
+            pitch = 0.20 + (bsz - 0.04) * 3.3              # 0.20→0.40
+        else:
+            pitch = 0.15 + bsz * 1.5                        # 0.15→0.21
+        pitch = max(0.10, min(0.52, pitch))  # NEVER go below 0.10 (no sky!)
+        self.motion.setAngles("HeadPitch", pitch, 0.25)
+
+        # ── Sonar obstacle check ───────────────────────────────────────
         sl = sr = 9.0
         try:
             sl = float(self.memory.getData("Device/SubDeviceList/US/Left/Sensor/Value"))
@@ -1475,46 +2316,54 @@ class BotFCBrain(object):
                 self.state = STATE_TACKLE
             return
 
-        # ── State transitions ──────────────────────────────────────────────
+        # ── State transitions ──────────────────────────────────────────
         if bsz >= KICK_BSZ_READY:
-            # Ball is large and (approximately) centred – go straight to ALIGN.
             self.motion.stopMove()
-            self.motion.setAngles("HeadYaw", 0.0, 0.2)
+            self.motion.setAngles("HeadYaw", 0.0, 0.3)
             with self.lock:
                 self.state = STATE_ALIGN
             return
 
-        # ── Body motion ────────────────────────────────────────────────────
-        # If the head had to turn significantly to find the ball, rotate the
-        # body first so the head re-centres.  This eliminates the odometry
-        # drift that caused the robot to walk past the ball.
-        if abs(head_yaw) > BODY_FOLLOW_THRESHOLD:
-            body_turn = max(-0.5, min(0.5, head_yaw * 1.5))
-            self.motion.moveToward(0.1, 0.0, body_turn)
-        else:
-            # Walking straight – nudge head back to centre so head and body
-            # remain aligned during forward motion.  Low speed (0.10) avoids
-            # jerky correction; the ball tracker will re-acquire the offset.
-            self.motion.setAngles("HeadYaw", 0.0, 0.10)
-            # Scale walk speed by estimated distance: fast when far, slow when close.
-            speed = max(0.2, min(0.7, (dist - KICK_APPROACH_DIST) * 0.6))
-            self.motion.moveToward(speed, 0.0, 0.0)
+        # ── Body movement: turn body toward ball, then walk forward ───
+        # The ball's world-relative bearing is approximately:
+        #   ball_bearing ≈ head_yaw - bx  (negative = ball to the right)
+        # We want body to turn toward that bearing.
+        ball_bearing = new_head_yaw  # head is already pointing at ball
+        body_turn = max(-0.6, min(0.6, ball_bearing * APPROACH_TURN_GAIN))
+
+        # Speed: fast when far, slow and careful when close.
+        speed = max(APPROACH_MIN_SPEED,
+                    min(APPROACH_MAX_SPEED, (dist - KICK_APPROACH_DIST) * 0.8))
+
+        # If ball is far off to the side, slow down and turn first.
+        if abs(ball_bearing) > 0.25:
+            speed = min(speed, 0.15)
+
+        self._stable_walk(speed, 0.0, body_turn)
 
     # ─── ALIGN ──────────────────────────────
     def _do_align(self):
-        self._update_local_map()
-        self.leds.fadeRGB("AllLeds", 0x00FF00, 0.15)
+        """Align the robot so that the ball is centered AND the robot faces
+        toward the target (opponent goal).  This ensures the kick sends the
+        ball in the right direction.
 
-        # Raise head pitch so ball falls inside the bottom camera FOV –
-        # this eliminates the blind spot between the two cameras.
+        Strategy:
+        1. Keep tracking the ball with the bottom camera.
+        2. Compare robot's current heading to the goal bearing.
+        3. Circle-strafe around the ball to approach from behind it
+           (relative to the goal direction).
+        4. Once ball is centered and body faces the goal → transition to KICK.
+        """
+        self._update_local_map()
+        self.leds.fadeRGB("AllLeds", 0x4D9FFF, 0.15)   # blue = aligning
+
+        # Head: look down at ball near feet
         self.motion.setAngles("HeadPitch", 0.45, 0.3)
+        self.motion.setAngles("HeadYaw",   0.0,  0.3)
 
         now = time.time()
-        if now - self.last_man_on_time > 4.0:
-            self.tts.post.say("Man on, man on")
-            self.last_man_on_time = now
 
-        # In ALIGN we prioritise the bottom camera but still accept top-cam data.
+        # In ALIGN prioritise bottom camera but still accept top-cam data.
         ball = self._detect_bottom_cam()
         if ball is None:
             ball = self._read_ball()
@@ -1552,24 +2401,51 @@ class BotFCBrain(object):
                 self.state = STATE_TACKLE
             return
 
+        # ── Goal alignment ─────────────────────────────────────────────────
+        # Compare robot heading to the desired kick direction.
+        goal_bearing = getattr(self, 'goal_bearing', DEFAULT_GOAL_BEARING)
+        robot_heading = 0.0
+        try:
+            p = self.motion.getRobotPosition(True)
+            robot_heading = p[2]
+        except Exception:
+            pass
+
+        heading_error = goal_bearing - robot_heading
+        # Normalise to [-pi, pi]
+        while heading_error >  math.pi: heading_error -= 2.0 * math.pi
+        while heading_error < -math.pi: heading_error += 2.0 * math.pi
+
+        ball_centered = abs(bx) < KICK_BX_MAX
+        facing_goal   = abs(heading_error) < 0.25   # ~14 degrees tolerance
+
         # ── Kick-ready transition ─────────────────────────────────────────
-        if abs(bx) < KICK_BX_MAX and bsz > KICK_BSZ_READY:
+        if ball_centered and bsz > KICK_BSZ_READY and facing_goal:
             self.motion.stopMove()
-            self.tts.post.say("I see the goal")
             with self.lock:
                 self.state = STATE_KICK
             return
 
-        # ── Alignment corrections (with dead-band to kill oscillation) ────
+        # ── Alignment corrections ──────────────────────────────────────────
+        # Priority 1: Center the ball horizontally (bx → 0).
+        # Priority 2: Rotate body toward the goal heading.
+
         if abs(bx) > ALIGN_BODY_DEADBAND:
-            lateral = -bx * 0.10    # gentle lateral shuffle
-            turn    = -bx * 0.65    # body rotation to re-centre
-            self.motion.moveToward(0.08, lateral, turn)
-        elif bsz < 0.15:
-            # Well-centred but not yet close enough – creep forward.
-            self.motion.moveToward(0.10, 0.0, 0.0)
+            # Ball off-center: shuffle laterally and rotate to center it.
+            lateral = -bx * 0.12    # gentle lateral shuffle
+            turn    = -bx * 0.70    # body rotation to re-centre ball
+            self._stable_walk(0.06, lateral, turn)
+        elif not facing_goal and bsz >= KICK_BSZ_READY * 0.8:
+            # Ball is centered but we're not facing the goal.
+            # Circle-strafe: walk sideways around the ball to change our
+            # heading without losing sight of it.
+            strafe_dir = 1.0 if heading_error > 0 else -1.0
+            self._stable_walk(0.0, strafe_dir * 0.08, heading_error * 0.4)
+        elif bsz < 0.12:
+            # Well-centred but not close enough – creep forward.
+            self._stable_walk(0.10, 0.0, 0.0)
         else:
-            # Very close and centred – hold still, let kick transition fire.
+            # Very close and centered – hold still.
             self.motion.stopMove()
 
     # ─── TACKLE ─────────────────────────────
@@ -1582,7 +2458,7 @@ class BotFCBrain(object):
             self.motion.setAngles(["LShoulderPitch", "RShoulderPitch"], [0.0, 0.0], 0.3)
             self.motion.setAngles(["LKneePitch",     "RKneePitch"],     [0.4, 0.4], 0.3)
             time.sleep(0.5)
-            self.motion.moveToward(1.0, 0.0, 0.0)
+            self._stable_walk(1.0, 0.0, 0.0)
             time.sleep(2.0)
             self.motion.stopMove()
             self.motion.setAngles(["LShoulderPitch", "RShoulderPitch"], [1.5, 1.5], 0.4)
@@ -1594,19 +2470,16 @@ class BotFCBrain(object):
 
     # ─── KICK ───────────────────────────────
     def _do_kick(self):
-        self.leds.fadeRGB("AllLeds", 0x0000FF, 0.15)
+        self.leds.fadeRGB("AllLeds", 0xFFFFFF, 0.15)   # white = kicking
         self.motion.stopMove()
 
-        # Raise head pitch to use the bottom camera's FOV, eliminating the
-        # blind spot between the two cameras when the ball is at the feet.
+        # Head: look down at ball at feet, centered.
         self.motion.setAngles("HeadYaw",   0.0,  0.3)
         self.motion.setAngles("HeadPitch", 0.52, 0.5)
         time.sleep(0.25)   # let robot settle before sampling
 
         # ── Kick walk-up ──────────────────────────────────────────────────
-        # If the ball appears smaller than expected (robot stopped a bit far),
-        # walk forward slowly until the ball fills the frame.  This mimics
-        # the B-Human "walk-up to ball" before an in-walk kick.
+        # Walk forward slowly until the ball fills the frame.
         for _ in range(8):
             ball = self._detect_bottom_cam()
             if ball is None:
@@ -1614,10 +2487,15 @@ class BotFCBrain(object):
                 if ball_r:
                     ball = ball_r
             if ball is not None:
-                _, _, bsz = ball
-                if bsz >= KICK_BSZ_READY * 1.4:
-                    break          # close enough to kick
-                self.motion.moveTo(0.05, 0.0, 0.0)   # 5 cm step forward
+                bx_wu, _, bsz_wu = ball
+                if bsz_wu >= KICK_BSZ_READY * 1.4:
+                    # Also do a final lateral correction during walk-up.
+                    if abs(bx_wu) > 0.03:
+                        lat = -bx_wu * 0.03
+                        self.motion.moveTo(0.02, lat, 0.0)
+                        time.sleep(0.2)
+                    break
+                self.motion.moveTo(0.05, 0.0, 0.0)
                 time.sleep(0.3)
             else:
                 break
@@ -1626,9 +2504,6 @@ class BotFCBrain(object):
         time.sleep(0.1)
 
         # ── Multi-sample verification ─────────────────────────────────────
-        # Collect KICK_VERIFY_SAMPLES fresh readings.  Because _read_ball()
-        # advances _last_ball_ts, each sample must have a new NAOqi timestamp –
-        # stale cache is never counted.  Bottom-cam samples are also accepted.
         bx_samples = []
         for _ in range(KICK_VERIFY_SAMPLES):
             ball = self._detect_bottom_cam()
@@ -1639,27 +2514,20 @@ class BotFCBrain(object):
             time.sleep(KICK_VERIFY_INTERVAL)
 
         if len(bx_samples) < 2:
-            # Ball not reliably in view – go back to ALIGN for another attempt.
             with self.lock:
                 self.state = STATE_ALIGN
             return
 
-        # Median of samples to reject single-frame noise spikes.
         bx_samples.sort()
         bx = bx_samples[len(bx_samples) // 2]
 
         # ── Select kick foot ──────────────────────────────────────────────
-        # bx < 0: ball is left of centre → kick with left foot (L).
-        # bx > 0: ball is right → kick with right foot (R).
         side_step_y = -0.04 if bx < -0.02 else 0.04
         kick_leg    = "L"   if bx < -0.02 else "R"
-
-        self.tts.post.say("Kick!")
 
         try:
             self.posture.goToPosture("Stand", 0.8)
             time.sleep(0.2)
-            # Step laterally to plant the support foot cleanly.
             self.motion.moveTo(0.0, side_step_y, 0.0)
             time.sleep(0.15)
 
@@ -1668,23 +2536,28 @@ class BotFCBrain(object):
             else:
                 hip = "LHipPitch"; knee = "LKneePitch"; roll = "RHipRoll"
 
-            # angleInterpolation gives precise absolute timing (seconds) rather
-            # than a speed fraction – the same technique B-Human uses for kicks.
-            # Times are cumulative seconds from "now".
-            # Phase 1 (0.0→0.25 s): shift weight onto support leg.
-            # Phase 2 (0.25→0.45 s): wind-up (pull knee back).
-            # Phase 3 (0.45→0.75 s): strike (snap forward + extend knee).
+            # Phase 1 (0.0→0.20 s): shift weight onto support leg.
+            # Phase 2 (0.20→0.40 s): wind-up (pull leg back).
+            # Phase 3 (0.40→0.65 s): strike (snap forward hard).
             self.motion.angleInterpolation(
                 [roll,  hip,   hip,   knee ],
-                [0.15, -0.45,  0.85, -0.75],
-                [0.25,  0.45,  0.75,  0.75],
-                True   # isAbsolute
+                [0.18, -0.50,  0.90, -0.80],
+                [0.20,  0.40,  0.65,  0.65],
+                True
             )
 
             self.posture.goToPosture("Stand", 0.8)
             with self.lock:
                 self.kick_count += 1
-                self.state = STATE_SEARCH
+
+            # ── Check if we scored ─────────────────────────────────────
+            if self._check_goal_scored():
+                with self.lock:
+                    self.goal_count += 1
+                    self.state = STATE_CELEBRATE
+            else:
+                with self.lock:
+                    self.state = STATE_SEARCH
         except Exception:
             try:
                 self.posture.goToPosture("Stand", 0.8)
