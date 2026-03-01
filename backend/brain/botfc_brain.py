@@ -2340,28 +2340,52 @@ class BotFCBrain(object):
         except Exception:
             pass
 
-        # Use prediction for fast-moving ball, raw bx otherwise
-        ball_moving = abs(self.ball_model.vbx) > BALL_VEL_THRESH
-        use_pred    = ball_moving and self.ball_model.confidence > 0.5
-        track_bx    = self.ball_model.pred_bx if use_pred else bx
+    def _track_head_to_ball(self):
+        """Unified method for smooth head tracking using a PD controller + ML predictions."""
+        if not self.ball_model.valid:
+            return
 
-        # Direct head servo: move head toward the ball.
-        # Larger gain = more aggressive tracking = ball stays in view.
-        yaw_error = track_bx * HEAD_TRACK_GAIN  # positive bx (left) -> positive yaw
-        new_head_yaw = head_yaw + yaw_error
-        new_head_yaw = max(-0.8, min(0.8, new_head_yaw))
-        self.motion.setAngles("HeadYaw", new_head_yaw, 0.6)
+        # Use prediction for tracking if confidence is high, else use raw EMA smoothed 'bx'
+        track_bx = self.ball_model.pred_bx if self.ball_model.confidence > 0.8 else self.ball_model.bx
+        
+        # Current head position
+        try:
+            head_yaw = self.motion.getAngles("HeadYaw", False)[0]
+            head_pitch = self.motion.getAngles("HeadPitch", False)[0]
+        except Exception:
+            return
+            
+        # PD Controller for Yaw
+        # Ensure we don't overshoot by factoring in current yaw velocity (d_bx)
+        Kp_yaw = 0.55   # lower proportional gain
+        Kd_yaw = 0.15   # derivative damping
+        
+        yaw_err = track_bx
+        yaw_vel = self.ball_model.vbx if hasattr(self.ball_model, 'vbx') else 0.0
+        
+        delta_yaw = (Kp_yaw * yaw_err) + (Kd_yaw * yaw_vel)
+        new_head_yaw = max(-1.0, min(1.0, head_yaw + delta_yaw))
 
-        # Pitch: ALWAYS look down. Ball is on the ground.
-        # Positive HeadPitch = looking DOWN on NAO.
-        if bsz > 0.10:
-            pitch = 0.40 + min(0.12, (bsz - 0.10) * 3.0)  # 0.40→0.52
-        elif bsz > 0.04:
-            pitch = 0.20 + (bsz - 0.04) * 3.3              # 0.20→0.40
+        # Dynamic Pitch Control based on ball distance/size
+        bsz = self.ball_model.bsz
+        if bsz > 0.10: 
+            target_pitch = 0.40 + min(0.12, (bsz - 0.10) * 3.0)
+        elif bsz > 0.05:
+            target_pitch = 0.35
         else:
-            pitch = 0.15 + bsz * 1.5                        # 0.15→0.21
-        pitch = max(0.10, min(0.52, pitch))  # NEVER go below 0.10 (no sky!)
-        self.motion.setAngles("HeadPitch", pitch, 0.25)
+            target_pitch = 0.15
+
+        self.motion.setAngles(["HeadYaw", "HeadPitch"], [new_head_yaw, target_pitch], 0.25)
+
+
+    # ─── APPROACH ─────────────────────────────
+    def _do_approach(self):
+        """Move towards the ball."""
+        self._update_local_map()
+        self.leds.fadeRGB("AllLeds", 0x00FF00, 0.15)
+
+        # ── Head tracking ─────────────────────────────────────────────────
+        self._track_head_to_ball()
 
         # ── Sonar obstacle check ───────────────────────────────────────
         sl = sr = 9.0
@@ -2464,20 +2488,8 @@ class BotFCBrain(object):
                 self.state = STATE_TACKLE
             return
 
-        # Keep head locked on ball
-        head_yaw = 0.0
-        try:
-            head_yaw = self.motion.getAngles("HeadYaw", False)[0]
-        except Exception:
-            pass
-            
-        new_head_yaw = max(-0.8, min(0.8, head_yaw + bx * HEAD_TRACK_GAIN))
-        self.motion.setAngles("HeadYaw", new_head_yaw, 0.6)
-        
-        # Pitch down
-        if bsz > 0.10: pitch = 0.40 + min(0.12, (bsz - 0.10) * 3.0)
-        else: pitch = 0.35
-        self.motion.setAngles("HeadPitch", pitch, 0.25)
+        # Keep head locked on ball using unified tracking
+        self._track_head_to_ball()
 
         # ── Vector Math for Approach Point (P) ──────────────────────
         goal_bearing = getattr(self, 'goal_bearing', DEFAULT_GOAL_BEARING)
@@ -2551,9 +2563,8 @@ class BotFCBrain(object):
         self._update_local_map()
         self.leds.fadeRGB("AllLeds", 0x4D9FFF, 0.15)   # blue = aligning
 
-        # Head: look down at ball near feet
-        self.motion.setAngles("HeadPitch", 0.45, 0.3)
-        self.motion.setAngles("HeadYaw",   0.0,  0.3)
+        # Keep tracking ball smoothly through ALIGN phase
+        self._track_head_to_ball()
 
         now = time.time()
 
@@ -2623,13 +2634,14 @@ class BotFCBrain(object):
             return
 
         # ── Alignment corrections ──────────────────────────────────────────
-        # Priority 1: Center the ball horizontally (bx → 0).
-        # Priority 2: Rotate body toward the goal heading.
+        # Fix: The rotation check should respond to ball_bearing, NOT raw camera 'bx'.
+        # If head is turned but body is not, bx is 0, but ball_bearing is high.
+        ball_bearing = head_yaw + bx
 
-        if abs(bx) > ALIGN_BODY_DEADBAND:
-            # Ball off-center: shuffle laterally and rotate to center it.
-            lateral = bx * 0.20    # aggressive lateral shuffle (positive is left)
-            turn    = bx * 0.70    # body rotation to re-centre ball (positive is left)
+        if abs(ball_bearing) > ALIGN_BODY_DEADBAND:
+            # Ball off-center relative to body: shuffle laterally and rotate to center it.
+            lateral = ball_bearing * 0.20    # aggressive lateral shuffle
+            turn    = ball_bearing * 0.70    # body rotation to face ball
             self._stable_walk(0.02, lateral, turn)
         elif not facing_goal and bsz >= KICK_BSZ_READY * 0.8:
             # Ball is centered but we're not facing the goal.
