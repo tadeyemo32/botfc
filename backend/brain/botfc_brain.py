@@ -2441,7 +2441,7 @@ class BotFCBrain(object):
 
         # ── Body movement: P-Controller & Look-Then-Walk ───
         # The ball's world-relative bearing is approximately:
-        #   ball_bearing ≈ head_yaw + bx  (positive = ball to the left)
+        #   ball_bearing ≈ head_yaw + track_bx  (positive = ball to the left)
         ball_bearing = head_yaw + track_bx
         
         # P-Controller for Body Turn Velocity (Theta)
@@ -2450,10 +2450,9 @@ class BotFCBrain(object):
         body_turn = max(-0.6, min(0.6, ball_bearing * Kp_turn))
         
         # Look-Then-Walk paradigm:
-        # Prevent straight forward walking if the head hasn't fully centered the ball.
+        # Prevent straight forward walking if the body is not physically facing the ball.
         # This keeps the robot planted until the visual angle error reaches < 0.25 rad.
-        # Widen the deadband from 0.1 to 0.25 so it doesn't stutter-step.
-        if abs(head_yaw) > 0.25:
+        if abs(ball_bearing) > 0.25:
             speed = 0.0  # Stand still and continue rotating (P-Controller doing the work)
         else:
             # When aligned, limit turn adjustments so it actually walks in a straight line
@@ -2463,8 +2462,6 @@ class BotFCBrain(object):
             # Advancing to ball: increase speed multiplier so it doesn't walk too slow
             speed = max(0.40,  # Minimum walk speed (was too slow before)
                         min(APPROACH_MAX_SPEED, (dist - KICK_APPROACH_DIST) * 1.5))
-
-        self._stable_walk(speed, 0.0, body_turn)
 
         self._stable_walk(speed, 0.0, body_turn)
 
