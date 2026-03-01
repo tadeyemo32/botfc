@@ -132,9 +132,24 @@ void HttpSession::handleRequest() {
       if (j.contains("by"))  patch["host_ball_by"]  = j["by"];
       if (j.contains("bsz")) patch["host_ball_bsz"] = j["bsz"];
       server_.updateTelemetry(patch);
-      server_.broadcastTelemetry(server_.getTelemetry().dump());
+      // Compute C++ decision and include in broadcast
+      nlohmann::json telem = server_.getTelemetry();
+      telem["cpp_action"] = server_.computeDecision();
+      server_.broadcastTelemetry(telem.dump());
     }
     res.body() = "{\"status\": \"ok\"}";
+  } else if (method == http::verb::post && target == "/api/command") {
+    // Frontend or operator posts a manual command to the robot.
+    // { "action": "KICK" | "SEARCH" | "STOP" | "APPROACH" | "ALIGN" }
+    auto j = nlohmann::json::parse(req_.body(), nullptr, false);
+    if (!j.is_discarded() && j.contains("action")) {
+      server_.queueBotCommand(j);
+    }
+    res.body() = "{\"status\": \"ok\"}";
+  } else if (method == http::verb::get && target == "/api/bot/command") {
+    // Robot polls this to receive the latest queued command.
+    // Returns {"action": null} if no command is pending.
+    res.body() = server_.popBotCommand().dump();
   } else {
     res.result(http::status::not_found);
   }

@@ -46,11 +46,14 @@ void WsSession::onRead(beast::error_code ec, std::size_t bytes_transferred) {
   buffer_.consume(buffer_.size());
 
   if (role_ == "bot") {
-    // Bot telemetry JSON → store and fan-out to frontend sessions
+    // Bot telemetry JSON → update store, compute local decision, broadcast
     try {
       auto j = nlohmann::json::parse(msg);
       server_.updateTelemetry(j);
-      server_.broadcastTelemetry(msg);
+      // Augment telemetry with the C++ local AI decision before sending to frontend
+      nlohmann::json telem = server_.getTelemetry();
+      telem["cpp_action"] = server_.computeDecision();
+      server_.broadcastTelemetry(telem.dump());
     } catch (...) {
     }
   } else if (role_ == "bot_camera") {

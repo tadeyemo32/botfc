@@ -89,6 +89,43 @@ void HttpServer::broadcastFrame(const std::string &frame_json) {
   }
 }
 
+// ── Local C++ decision engine ─────────────────────────────────────────────
+
+std::string HttpServer::computeDecision() {
+  // Mirror FSM logic on the server using live telemetry from the robot.
+  // This is broadcast to the frontend as "cpp_action" and also available
+  // for the robot to poll via GET /api/bot/command.
+  auto t = getTelemetry();
+  bool ball_valid = t.value("ball_valid", false);
+  if (!ball_valid)
+    return "SEARCH";
+  double bsz  = t.value("ball_bsz",  0.0);
+  double bx   = t.value("ball_bx",   0.0);
+  double dist = t.value("ball_dist", 99.0);
+  if (dist > 0.8 || bsz < 0.04)
+    return "APPROACH";
+  if (std::abs(bx) > 0.12)
+    return "ALIGN";
+  return "KICK";
+}
+
+// ── Command channel (frontend → server → robot) ───────────────────────────
+
+void HttpServer::queueBotCommand(const nlohmann::json &cmd) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  pending_bot_command_  = cmd;
+  has_pending_command_  = true;
+}
+
+nlohmann::json HttpServer::popBotCommand() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!has_pending_command_)
+    return {{"action", nullptr}};
+  nlohmann::json cmd = pending_bot_command_;
+  has_pending_command_ = false;
+  return cmd;
+}
+
 // ── Robot IP ──────────────────────────────────────────────────────────────
 
 void HttpServer::setRobotIp(const std::string &ip) {
