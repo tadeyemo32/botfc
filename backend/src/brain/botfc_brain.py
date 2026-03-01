@@ -1,8 +1,17 @@
 #!/usr/bin/env python2
 # -*- coding: utf-8 -*-
 """
-BotFC Brain – Python Port (1:1 from C++)
+BotFC Brain – Enhanced Edition
 Runs directly on the NAO/Pepper robot using the NAOqi Python SDK.
+
+Key upgrades over the original:
+  • BallModel – EMA smoother + heading memory + distance estimate
+  • Bottom camera red-blob detector (eliminates the foot blind-spot)
+  • Timestamp-based stale detection guard (NAOqi caches last value)
+  • Ball persistence: brief occlusions don't abort the approach
+  • Search starts facing last known ball heading
+  • In-walk approach: body alignment driven by head-yaw encoder (no camera lag)
+  • Kick walk-up: walk to < KICK_APPROACH_DIST before planting kick
 
 Usage:
   python botfc_brain.py --trait=balanced --server-ip=192.168.1.100 --server-port=5050
@@ -18,37 +27,142 @@ import argparse
 import threading
 import struct
 
-# NAOqi Python SDK (pre-installed on the robot)
 from naoqi import ALBroker, ALProxy
 
 # ─────────────────────────────────────────────
-# Constants (matching C++ originals)
+# Safety / field constants
 # ─────────────────────────────────────────────
 MAX_FIELD_RADIUS = 2.5
-COMBAT_DISTANCE = 0.40
+COMBAT_DISTANCE  = 0.40
 MOTOR_TEMP_LIMIT = 60.0
 
 # ─────────────────────────────────────────────
-# Roles & States (from Roles.h)
+# Ball model constants
 # ─────────────────────────────────────────────
-ROLE_STRIKER = "STRIKER"
+# bsz when the ball is exactly 1 m away – calibrate on field!
+# Increase if your ball looks small at 1 m; decrease if too large.
+BALL_K_CONST   = 0.042
+BALL_EMA_ALPHA = 0.60    # weight on new measurement (0=frozen, 1=raw)
+BALL_LOSS_TIME = 1.8     # seconds before the model is marked invalid
+
+# ─────────────────────────────────────────────
+# Head-tracking / approach constants
+# ─────────────────────────────────────────────
+HEAD_TRACK_GAIN       = 0.50   # head servo gain (rad / bx unit)
+BODY_FOLLOW_THRESHOLD = 0.18   # |head_yaw| above which we rotate before walking
+ALIGN_BODY_DEADBAND   = 0.07   # bx dead-zone in ALIGN to kill oscillation
+
+# ─────────────────────────────────────────────
+# Kick constants
+# ─────────────────────────────────────────────
+KICK_VERIFY_SAMPLES  = 4
+KICK_VERIFY_INTERVAL = 0.05   # s between samples
+KICK_BSZ_READY       = 0.10   # ball must appear at least this large to kick
+KICK_BX_MAX          = 0.05   # horizontal tolerance before kicking
+KICK_APPROACH_DIST   = 0.22   # target distance (m) for kick walk-up
+
+# ─────────────────────────────────────────────
+# Bottom camera (BGR, QVGA=320×240, 10 fps)
+# Subscribe as a separate NAOqi client so we can run it alongside the
+# top-camera ALRedBallDetection subscription.
+# ─────────────────────────────────────────────
+BOT_CAM_ID      = 1    # bottom camera
+BOT_CAM_RES     = 1    # kQVGA  (320 × 240)
+BOT_CAM_FORMAT  = 13   # kBGR
+BOT_CAM_FPS     = 10
+BOT_CAM_STRIDE  = 4    # check every Nth pixel (speed vs accuracy)
+
+# Red-ball thresholds in BGR colour space.
+# Tune RED_R_MIN downward if the robot misses the ball under warm/dim lighting.
+RED_R_MIN      = 135
+RED_B_MAX      = 90
+RED_G_MAX      = 110
+RED_DIFF_MIN   = 55    # red must exceed max(B,G) by this margin
+RED_MIN_PX     = 40    # minimum blob pixel count
+
+# ─────────────────────────────────────────────
+# Camera streamer constants (JPEG to server)
+# ─────────────────────────────────────────────
+STREAM_CAM_ID     = 0    # top camera
+STREAM_CAM_RES    = 1    # kQVGA (320×240)
+STREAM_CAM_FORMAT = 21   # kJpegColorSpace
+STREAM_CAM_FPS    = 5    # frames per second sent to server
+
+# ─────────────────────────────────────────────
+# States & Roles
+# ─────────────────────────────────────────────
+ROLE_STRIKER  = "STRIKER"
 ROLE_DEFENDER = "DEFENDER"
 ROLE_BALANCED = "BALANCED"
 
-STATE_INIT = "INIT"
-STATE_SEARCH = "SEARCH"
+STATE_INIT     = "INIT"
+STATE_SEARCH   = "SEARCH"
 STATE_APPROACH = "APPROACH"
-STATE_ALIGN = "ALIGN"
-STATE_TACKLE = "TACKLE"
-STATE_KICK = "KICK"
-STATE_RECOVER = "RECOVER"
+STATE_ALIGN    = "ALIGN"
+STATE_TACKLE   = "TACKLE"
+STATE_KICK     = "KICK"
+STATE_RECOVER  = "RECOVER"
 STATE_HALFTIME = "HALFTIME"
 
 
 # ─────────────────────────────────────────────
-# Telemetry Client (from TelemetryClient.cpp)
-# WebSocket client that sends state to the
-# macOS Boost server via /api/ws/bot
+# BallModel – EMA smoother + distance + heading
+# ─────────────────────────────────────────────
+class BallModel(object):
+    """Exponential-moving-average ball tracker.
+
+    Maintains a smoothed estimate of ball position in camera space and
+    estimates distance from apparent size.  Remembers the last known
+    heading so the search state can begin facing the right direction
+    instead of doing a blind full-circle sweep every time.
+
+    Call tick() once per FSM cycle to expire stale readings.
+    """
+
+    def __init__(self):
+        self._bx   = 0.0
+        self._by   = 0.0
+        self._bsz  = 0.0
+        self.dist  = 9.9    # estimated distance in metres
+        self.valid = False
+        self.last_seen    = 0.0
+        self.last_heading = 0.0   # head_yaw + bx at last confirmed sighting
+
+    # Read-only smoothed values
+    @property
+    def bx(self):  return self._bx
+    @property
+    def by(self):  return self._by
+    @property
+    def bsz(self): return self._bsz
+
+    def update(self, raw_bx, raw_by, raw_bsz, head_yaw):
+        a = BALL_EMA_ALPHA
+        if self.valid:
+            self._bx  = a * raw_bx  + (1.0 - a) * self._bx
+            self._by  = a * raw_by  + (1.0 - a) * self._by
+            self._bsz = a * raw_bsz + (1.0 - a) * self._bsz
+        else:
+            self._bx, self._by, self._bsz = raw_bx, raw_by, raw_bsz
+        self.dist = max(0.1, BALL_K_CONST / max(self._bsz, 0.001))
+        # last_heading is the robot-relative angle at which the ball lies.
+        # head_yaw > 0 means head is turned left; adding bx (positive = right
+        # of frame) gives the approximate bearing relative to the robot body.
+        self.last_heading = head_yaw + self._bx
+        self.valid = True
+        self.last_seen = time.time()
+
+    def age(self):
+        return (time.time() - self.last_seen) if self.valid else -1.0
+
+    def tick(self):
+        """Mark the model invalid when no detection has arrived for too long."""
+        if self.valid and self.age() > BALL_LOSS_TIME:
+            self.valid = False
+
+
+# ─────────────────────────────────────────────
+# TelemetryClient  (unchanged from original)
 # ─────────────────────────────────────────────
 class TelemetryClient(object):
     def __init__(self, host, port):
@@ -79,13 +193,14 @@ class TelemetryClient(object):
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=3)
 
-    def update(self, state, kicks, ball_age, break_remaining):
+    def update(self, state, kicks, ball_age, break_remaining, battery_pct=-1):
         with self.lock:
             self.current_data = {
                 "state": state,
                 "kicks": kicks,
                 "ball_age": ball_age,
                 "break_remaining": break_remaining,
+                "battery_pct": battery_pct,
             }
 
     def _build_payload(self):
@@ -95,10 +210,7 @@ class TelemetryClient(object):
         return json.dumps(d)
 
     def _loop(self):
-        """WebSocket send loop with reconnection, using raw sockets
-        since the robot's Python 2.7 env may not have the websocket lib."""
         import socket
-        import hashlib
         import base64
 
         while self.running:
@@ -108,7 +220,6 @@ class TelemetryClient(object):
                 sock.settimeout(5)
                 sock.connect((self.host, self.port))
 
-                # WebSocket handshake (RFC 6455)
                 ws_key = base64.b64encode(os.urandom(16))
                 handshake = (
                     "GET /api/ws/bot HTTP/1.1\r\n"
@@ -122,12 +233,11 @@ class TelemetryClient(object):
                 ).format(host=self.host, port=self.port, key=ws_key)
                 sock.sendall(handshake.encode("utf-8"))
 
-                # Read HTTP response
                 resp = b""
                 while b"\r\n\r\n" not in resp:
                     chunk = sock.recv(4096)
                     if not chunk:
-                        raise Exception("Handshake failed: connection closed")
+                        raise Exception("Handshake failed")
                     resp += chunk
 
                 if b"101" not in resp.split(b"\r\n")[0]:
@@ -136,13 +246,10 @@ class TelemetryClient(object):
                 print("[Telemetry] Connected to ws://{}:{}/api/ws/bot".format(
                     self.host, self.port))
 
-                # Send loop
                 while self.running:
-                    payload = self._build_payload()
-                    self._ws_send(sock, payload)
+                    self._ws_send(sock, self._build_payload())
                     time.sleep(0.1)
 
-                # Close frame
                 self._ws_close(sock)
             except Exception as e:
                 print("[Telemetry] Error: {}. Retrying in 2s...".format(e))
@@ -157,13 +264,12 @@ class TelemetryClient(object):
 
     @staticmethod
     def _ws_send(sock, message):
-        """Send a WebSocket text frame (masked, per RFC 6455 client)."""
         data = message.encode("utf-8")
         length = len(data)
         frame = bytearray()
-        frame.append(0x81)  # FIN + text opcode
+        frame.append(0x81)
         if length <= 125:
-            frame.append(0x80 | length)  # MASK bit set
+            frame.append(0x80 | length)
         elif length <= 65535:
             frame.append(0x80 | 126)
             frame.extend(struct.pack("!H", length))
@@ -178,9 +284,8 @@ class TelemetryClient(object):
 
     @staticmethod
     def _ws_close(sock):
-        """Send WebSocket close frame."""
-        frame = bytearray([0x88, 0x80])  # FIN + close, masked, 0 len
-        frame.extend(os.urandom(4))      # mask key
+        frame = bytearray([0x88, 0x80])
+        frame.extend(os.urandom(4))
         try:
             sock.sendall(bytes(frame))
         except Exception:
@@ -188,9 +293,7 @@ class TelemetryClient(object):
 
 
 # ─────────────────────────────────────────────
-# ML Data Logger (from MLDataLogger.cpp)
-# Captures camera frames + FSM state for
-# training data collection
+# MLDataLogger  (unchanged from original)
 # ─────────────────────────────────────────────
 class MLDataLogger(object):
     def __init__(self, robot_ip, robot_port):
@@ -217,7 +320,6 @@ class MLDataLogger(object):
         if self.running or not self.video_device:
             return
         try:
-            # kTopCamera=0, kQVGA=1, kYUV422=9, 5fps
             self.video_client_name = self.video_device.subscribeCamera(
                 "BotFC_ML_Logger", 0, 1, 9, 5)
             self.running = True
@@ -254,83 +356,192 @@ class MLDataLogger(object):
     def _loop(self):
         while self.running:
             try:
-                img_data = self.video_device.getImageRemote(
-                    self.video_client_name)
+                img_data = self.video_device.getImageRemote(self.video_client_name)
                 if img_data and len(img_data) > 6:
                     raw_bytes = img_data[6]
-                    base_name = "{}frame_{}".format(
-                        self.out_dir, self.frame_index)
-                    img_path = base_name + ".raw"
-                    json_path = base_name + ".json"
-
-                    with open(img_path, "wb") as f:
+                    base_name = "{}frame_{}".format(self.out_dir, self.frame_index)
+                    with open(base_name + ".raw", "wb") as f:
                         f.write(raw_bytes)
-
                     with self.lock:
                         t = self.current_telemetry.copy()
-                    self._save_json(json_path, t)
-
+                    self._save_json(base_name + ".json", t)
                     self.frame_index += 1
                     self.video_device.releaseImage(self.video_client_name)
             except Exception:
                 pass
-            time.sleep(0.2)  # 5Hz
+            time.sleep(0.2)
 
 
 # ─────────────────────────────────────────────
-# BotFCBrain (from BotFCBrain.cpp)
-# The main Finite State Machine controlling
-# the robot's soccer behavior
+# CameraStreamer – JPEG frames via WS to server
+# ─────────────────────────────────────────────
+class CameraStreamer(object):
+    """Grabs JPEG frames from NAOqi and streams them to the C++ server via
+    WebSocket /api/ws/bot_camera.  The server stores the latest frame and
+    relays it to browser clients on /api/ws/camera_feed.
+
+    Uses kJpegColorSpace=21 so no re-encoding is needed on the robot.
+    """
+
+    def __init__(self, robot_ip, robot_port, server_host, server_port):
+        self.robot_ip    = robot_ip
+        self.robot_port  = robot_port
+        self.server_host = server_host
+        self.server_port = server_port
+        self.running     = False
+        self.thread      = None
+        self._vid        = None
+        self._cam_client = ""
+
+    def start(self):
+        if self.running:
+            return
+        try:
+            self._vid = ALProxy("ALVideoDevice", self.robot_ip, self.robot_port)
+            self._cam_client = self._vid.subscribeCamera(
+                "BotFC_Stream", STREAM_CAM_ID, STREAM_CAM_RES,
+                STREAM_CAM_FORMAT, STREAM_CAM_FPS)
+        except Exception as e:
+            print("[CamStream] Camera init failed: {}".format(e))
+            return
+        self.running = True
+        self.thread  = threading.Thread(target=self._loop)
+        self.thread.daemon = True
+        self.thread.start()
+        print("[CamStream] Started JPEG stream to {}:{}.".format(
+            self.server_host, self.server_port))
+
+    def stop(self):
+        self.running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=3)
+        if self._vid and self._cam_client:
+            try:
+                self._vid.unsubscribe(self._cam_client)
+            except Exception:
+                pass
+
+    def _loop(self):
+        import socket as _socket
+        import base64 as _b64
+
+        while self.running:
+            sock = None
+            try:
+                sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                sock.settimeout(5)
+                sock.connect((self.server_host, self.server_port))
+
+                ws_key = _b64.b64encode(os.urandom(16))
+                handshake = (
+                    "GET /api/ws/bot_camera HTTP/1.1\r\n"
+                    "Host: {host}:{port}\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    "Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n"
+                    "User-Agent: BotFC-CamStream-v1\r\n"
+                    "\r\n"
+                ).format(host=self.server_host, port=self.server_port, key=ws_key)
+                sock.sendall(handshake.encode("utf-8"))
+
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        raise Exception("Handshake failed")
+                    resp += chunk
+
+                if b"101" not in resp.split(b"\r\n")[0]:
+                    raise Exception("WS upgrade rejected")
+
+                print("[CamStream] Connected.")
+
+                interval = 1.0 / STREAM_CAM_FPS
+                while self.running:
+                    img = self._vid.getImageRemote(self._cam_client)
+                    if img and len(img) > 6:
+                        w   = int(img[0])
+                        h   = int(img[1])
+                        jpg = bytes(bytearray(img[6]))
+                        b64 = _b64.b64encode(jpg).decode("ascii")
+                        payload = json.dumps({"type": "frame", "w": w, "h": h, "jpg": b64})
+                        TelemetryClient._ws_send(sock, payload)
+                        self._vid.releaseImage(self._cam_client)
+                    time.sleep(interval)
+
+                TelemetryClient._ws_close(sock)
+            except Exception as e:
+                print("[CamStream] Error: {}. Retry in 3s...".format(e))
+            finally:
+                if sock:
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+            if self.running:
+                time.sleep(3)
+
+
+# ─────────────────────────────────────────────
+# BotFCBrain
 # ─────────────────────────────────────────────
 class BotFCBrain(object):
+
     def __init__(self, robot_ip, robot_port, trait, server_ip, server_port):
-        self.robot_ip = robot_ip
+        self.robot_ip   = robot_ip
         self.robot_port = robot_port
 
-        # Role
         if trait == "offense":
-            self.role = ROLE_STRIKER
+            self.role  = ROLE_STRIKER
         elif trait == "defense":
-            self.role = ROLE_DEFENDER
+            self.role  = ROLE_DEFENDER
         else:
-            self.role = ROLE_BALANCED
-            trait = "balanced"
+            self.role  = ROLE_BALANCED
+            trait      = "balanced"
         self.trait = trait
 
-        # State
-        self.state = STATE_INIT
-        self.lock = threading.Lock()
-        self.running = False
-        self.kick_count = 0
-        self.overheat_count = 0
-        self.break_remaining = 0
-        self.origin_x = 0.0
-        self.origin_y = 0.0
-        self.origin_theta = 0.0
-        self.last_ball_time = 0.0
-        self.last_man_on_time = 0.0
-        self.last_overheat_time = 0.0
-        self.search_yaw = 0.0
-        self.search_yaw_dir = 1.0
-        self.field_map = {}
-        self.fsm_thread = None
+        # FSM state
+        self.state             = STATE_INIT
+        self.lock              = threading.Lock()
+        self.running           = False
+        self.kick_count        = 0
+        self.overheat_count    = 0
+        self.break_remaining   = 0
+        self.origin_x          = 0.0
+        self.origin_y          = 0.0
+        self.origin_theta      = 0.0
+        self.last_ball_time    = 0.0
+        self.last_man_on_time  = 0.0
+        self.last_overheat_time= 0.0
+        self.search_yaw        = 0.0
+        self.search_yaw_dir    = 1.0
+        self.field_map         = {}
+        self.fsm_thread        = None
 
-        # Telemetry
+        # Ball perception
+        self._last_ball_ts     = None     # NAOqi timestamp guard (stale detection)
+        self.ball_model        = BallModel()
+
+        # Bottom camera
+        self._vid              = None     # ALVideoDevice proxy
+        self._bot_cam_client   = ""       # subscription name
+
+        # Subsystems
         self.telemetry_client = TelemetryClient(server_ip, server_port)
+        self.data_logger      = MLDataLogger(robot_ip, robot_port)
+        self.camera_streamer  = CameraStreamer(robot_ip, robot_port, server_ip, server_port)
 
-        # ML Data Logger
-        self.data_logger = MLDataLogger(robot_ip, robot_port)
+        # NAOqi proxies (initialised in start())
+        self.motion    = None
+        self.posture   = None
+        self.memory    = None
+        self.tts       = None
+        self.leds      = None
+        self.ball_det  = None
+        self.sonar_p   = None
+        self.battery   = None
 
-        # Proxies (initialized on start())
-        self.motion = None
-        self.posture = None
-        self.memory = None
-        self.tts = None
-        self.leds = None
-        self.ball_det = None
-        self.sonar_p = None
-
-        # Temperature sensor keys
         self.temp_keys = [
             "Device/SubDeviceList/LHipPitch/Temperature/Sensor/Value",
             "Device/SubDeviceList/RHipPitch/Temperature/Sensor/Value",
@@ -338,23 +549,36 @@ class BotFCBrain(object):
             "Device/SubDeviceList/RKneePitch/Temperature/Sensor/Value",
         ]
 
+    # ─── Startup / shutdown ──────────────────
     def start(self):
         if self.running:
             return
 
         try:
-            self.motion = ALProxy("ALMotion", self.robot_ip, self.robot_port)
-            self.posture = ALProxy("ALRobotPosture", self.robot_ip, self.robot_port)
-            self.memory = ALProxy("ALMemory", self.robot_ip, self.robot_port)
-            self.tts = ALProxy("ALTextToSpeech", self.robot_ip, self.robot_port)
-            self.leds = ALProxy("ALLeds", self.robot_ip, self.robot_port)
+            self.motion   = ALProxy("ALMotion",         self.robot_ip, self.robot_port)
+            self.posture  = ALProxy("ALRobotPosture",   self.robot_ip, self.robot_port)
+            self.memory   = ALProxy("ALMemory",         self.robot_ip, self.robot_port)
+            self.tts      = ALProxy("ALTextToSpeech",   self.robot_ip, self.robot_port)
+            self.leds     = ALProxy("ALLeds",           self.robot_ip, self.robot_port)
             self.ball_det = ALProxy("ALRedBallDetection", self.robot_ip, self.robot_port)
-            self.sonar_p = ALProxy("ALSonar", self.robot_ip, self.robot_port)
+            self.sonar_p  = ALProxy("ALSonar",          self.robot_ip, self.robot_port)
         except Exception as e:
             print("[BotFC] FATAL: Failed to init proxies: {}".format(e))
             return
 
+        try:
+            self.battery = ALProxy("ALBattery", self.robot_ip, self.robot_port)
+        except Exception as e:
+            print("[BotFC] ALBattery unavailable: {}".format(e))
+
         self.motion.setStiffnesses("Body", 1.0)
+
+        # Disable collision protection so the robot can close in on the ball
+        # without auto-shuffling away from "obstacles" (its own arms/opponent).
+        try:
+            self.motion.setExternalCollisionProtectionEnabled("All", False)
+        except Exception:
+            pass
 
         try:
             self.ball_det.subscribe("BotFCBrain", 33, 0.0)
@@ -365,14 +589,22 @@ class BotFCBrain(object):
         except Exception:
             pass
 
+        # Bottom camera – separate subscription so we can query it in align/kick
+        # even when ALRedBallDetection is using the top camera.
+        try:
+            self._vid = ALProxy("ALVideoDevice", self.robot_ip, self.robot_port)
+            self._bot_cam_client = self._vid.subscribeCamera(
+                "BotFC_BottomDetect", BOT_CAM_ID, BOT_CAM_RES, BOT_CAM_FORMAT, BOT_CAM_FPS)
+            print("[BotFC] Bottom camera subscribed.")
+        except Exception as e:
+            print("[BotFC] Bottom camera unavailable: {}".format(e))
+
         self.posture.goToPosture("StandInit", 1.0)
-        self.tts.post.say("Python Brain online.")
+        self.tts.post.say("Brain online. Let's play football.")
 
         try:
             p = self.motion.getRobotPosition(True)
-            self.origin_x = p[0]
-            self.origin_y = p[1]
-            self.origin_theta = p[2]
+            self.origin_x, self.origin_y, self.origin_theta = p[0], p[1], p[2]
         except Exception:
             pass
 
@@ -382,18 +614,15 @@ class BotFCBrain(object):
             self.state = STATE_SEARCH
 
         self.running = True
-
-        # Start subsystems
         self.data_logger.start()
         self.telemetry_client.start(self.trait)
+        self.camera_streamer.start()
 
-        # Spawn FSM thread
         self.fsm_thread = threading.Thread(target=self._run)
         self.fsm_thread.daemon = True
         self.fsm_thread.start()
 
-        print("[BotFC] Brain started. Role={}, Trait={}".format(
-            self.role, self.trait))
+        print("[BotFC] Brain started. Role={}, Trait={}".format(self.role, self.trait))
 
     def stop(self):
         if not self.running:
@@ -402,9 +631,17 @@ class BotFCBrain(object):
 
         self.data_logger.stop()
         self.telemetry_client.stop()
+        self.camera_streamer.stop()
 
         if self.fsm_thread and self.fsm_thread.is_alive():
             self.fsm_thread.join(timeout=5)
+
+        # Unsubscribe bottom camera
+        if self._vid and self._bot_cam_client:
+            try:
+                self._vid.unsubscribe(self._bot_cam_client)
+            except Exception:
+                pass
 
         try:
             self.motion.stopMove()
@@ -426,93 +663,211 @@ class BotFCBrain(object):
 
         print("[BotFC] Brain stopped safely.")
 
-    # ─── FSM Main Loop ─────────────────────
+    # ─── Kill switch ────────────────────────
+    def _check_kill_switch(self):
+        """Return True if any head touch sensor is pressed.
+
+        Pressing the head is the standard RoboCup SPL 'penalise / stop' signal.
+        We halt all motion and crouch the robot to a safe posture immediately.
+        """
+        keys = [
+            "Device/SubDeviceList/Head/Touch/Front/Sensor/Value",
+            "Device/SubDeviceList/Head/Touch/Middle/Sensor/Value",
+            "Device/SubDeviceList/Head/Touch/Rear/Sensor/Value",
+        ]
+        try:
+            for k in keys:
+                if float(self.memory.getData(k)) > 0.5:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    # ─── FSM Main Loop ──────────────────────
     def _run(self):
         while self.running:
+            # ── Kill switch (head touch) ───────────────────────────────────
+            if self._check_kill_switch():
+                self.motion.stopMove()
+                try:
+                    self.posture.goToPosture("Crouch", 0.8)
+                    self.motion.setStiffnesses("Body", 0.0)
+                    self.tts.post.say("Stopping.")
+                except Exception:
+                    pass
+                # Wait until touch is released before resuming
+                while self.running and self._check_kill_switch():
+                    time.sleep(0.2)
+                if self.running:
+                    self.motion.setStiffnesses("Body", 1.0)
+                    self.posture.goToPosture("StandInit", 1.0)
+                    with self.lock:
+                        self.state = STATE_SEARCH
+                continue
+
             self._safety_check()
 
-            with self.lock:
-                s = self.state
-                k = self.kick_count
-                br = self.break_remaining
-                lbt = self.last_ball_time
+            # Tick the ball model: expire data older than BALL_LOSS_TIME
+            self.ball_model.tick()
 
-            # Update telemetry
-            ball_age = (time.time() - lbt) if lbt > 0 else -1.0
-            self.telemetry_client.update(s, k, ball_age, br)
+            with self.lock:
+                s  = self.state
+                k  = self.kick_count
+                br = self.break_remaining
+                lbt= self.last_ball_time
+
+            ball_age = self.ball_model.age()
+            bat = -1
+            try:
+                if self.battery:
+                    bat = int(self.battery.getBatteryCharge())
+            except Exception:
+                pass
+            self.telemetry_client.update(s, k, ball_age, br, bat)
 
             if s != STATE_HALFTIME:
                 self._enforce_bounds()
 
-                if s == STATE_SEARCH:
-                    self._do_search()
-                elif s == STATE_APPROACH:
-                    self._do_approach()
-                elif s == STATE_ALIGN:
-                    self._do_align()
-                elif s == STATE_KICK:
-                    self._do_kick()
-                elif s == STATE_TACKLE:
-                    self._do_tackle()
+                if   s == STATE_SEARCH:   self._do_search()
+                elif s == STATE_APPROACH: self._do_approach()
+                elif s == STATE_ALIGN:    self._do_align()
+                elif s == STATE_KICK:     self._do_kick()
+                elif s == STATE_TACKLE:   self._do_tackle()
                 else:
                     with self.lock:
                         self.state = STATE_SEARCH
 
             time.sleep(0.05)
 
-    # ─── Sonar Local Map ────────────────────
+    # ─── Ball perception helpers ─────────────
+
+    def _read_ball(self):
+        """Return (bx, by, bsz) from ALRedBallDetection if the timestamp is NEW.
+
+        NAOqi never clears redBallDetected when the ball leaves view – it just
+        stops advancing the timestamp.  Comparing consecutive timestamps is the
+        only reliable way to distinguish a live detection from stale cache.
+        """
+        try:
+            data = self.memory.getData("redBallDetected")
+            if not (data and len(data) >= 2):
+                return None
+            ts = (int(data[0][0]), int(data[0][1]))
+            if ts == self._last_ball_ts:
+                return None             # unchanged timestamp → stale
+            self._last_ball_ts = ts     # new timestamp → live detection
+            info = data[1]
+            return (float(info[0]), float(info[1]), float(info[2]))
+        except Exception:
+            return None
+
+    def _detect_bottom_cam(self):
+        """Detect red ball in the bottom camera using BGR thresholding.
+
+        Sampling every BOT_CAM_STRIDE pixels keeps CPU usage low on the NAO's
+        ARM core while still giving a reliable centroid for close-range use.
+        Returns (bx, by, bsz) normalised to the same convention as _read_ball(),
+        or None if no blob found.
+        """
+        if not (self._vid and self._bot_cam_client):
+            return None
+        try:
+            img = self._vid.getImageRemote(self._bot_cam_client)
+            if not img or len(img) < 7:
+                return None
+            width  = int(img[0])
+            height = int(img[1])
+            pixels = bytearray(img[6])
+
+            bx_sum = by_sum = count = 0
+            stride = BOT_CAM_STRIDE * 3   # bytes to skip per sampled pixel
+
+            for off in range(0, len(pixels) - 2, stride):
+                b = pixels[off]
+                g = pixels[off + 1]
+                r = pixels[off + 2]
+                if (r > RED_R_MIN and b < RED_B_MAX and g < RED_G_MAX
+                        and r - max(b, g) > RED_DIFF_MIN):
+                    px = (off // 3) % width
+                    py = (off // 3) // width
+                    bx_sum += px
+                    by_sum += py
+                    count  += 1
+
+            self._vid.releaseImage(self._bot_cam_client)
+
+            if count < RED_MIN_PX:
+                return None
+
+            # Normalise: centre of frame = 0, half-width = ±0.5
+            cx = (float(bx_sum) / count - width  * 0.5) / width
+            cy = (float(by_sum) / count - height * 0.5) / height
+            sz = float(count) / (width * height)
+            return (cx, cy, sz)
+        except Exception:
+            return None
+
+    def _get_ball_and_update_model(self):
+        """Query both cameras, update the BallModel if anything is found.
+
+        Top camera (ALRedBallDetection) is the primary source for far-ball.
+        Bottom camera is used in addition when we're in ALIGN / KICK range.
+        Returns the raw (bx, by, bsz) of the freshest reading, or None.
+        """
+        ball = self._read_ball()           # top cam (far range)
+
+        if ball is None:
+            ball = self._detect_bottom_cam()  # bottom cam (close range / blind spot)
+
+        if ball is not None:
+            bx, by, bsz = ball
+            try:
+                head_yaw = self.motion.getAngles("HeadYaw", False)[0]
+            except Exception:
+                head_yaw = 0.0
+            self.ball_model.update(bx, by, bsz, head_yaw)
+
+        return ball
+
+    # ─── Sonar / field map ──────────────────
     def _update_local_map(self):
         try:
-            sl = float(self.memory.getData(
-                "Device/SubDeviceList/US/Left/Sensor/Value"))
-            sr = float(self.memory.getData(
-                "Device/SubDeviceList/US/Right/Sensor/Value"))
-            p = self.motion.getRobotPosition(True)
-            left_angle = (p[2] + 0.5) * (180.0 / math.pi)
-            right_angle = (p[2] - 0.5) * (180.0 / math.pi)
-            sec_l = int(left_angle / 30.0) * 30
-            sec_r = int(right_angle / 30.0) * 30
+            sl = float(self.memory.getData("Device/SubDeviceList/US/Left/Sensor/Value"))
+            sr = float(self.memory.getData("Device/SubDeviceList/US/Right/Sensor/Value"))
+            p  = self.motion.getRobotPosition(True)
+            la = (p[2] + 0.5) * (180.0 / math.pi)
+            ra = (p[2] - 0.5) * (180.0 / math.pi)
+            sl_sec = int(la / 30.0) * 30
+            sr_sec = int(ra / 30.0) * 30
 
             with self.lock:
-                if sec_l not in self.field_map or sl < self.field_map[sec_l]:
-                    self.field_map[sec_l] = sl
-                if sec_r not in self.field_map or sr < self.field_map[sec_r]:
-                    self.field_map[sec_r] = sr
+                if sl_sec not in self.field_map or sl < self.field_map[sl_sec]:
+                    self.field_map[sl_sec] = sl
+                if sr_sec not in self.field_map or sr < self.field_map[sr_sec]:
+                    self.field_map[sr_sec] = sr
 
-            # Build ML telemetry snapshot
             snapshot = {
-                "headYaw": self.motion.getAngles("HeadYaw", False)[0],
+                "headYaw":   self.motion.getAngles("HeadYaw",   False)[0],
                 "headPitch": self.motion.getAngles("HeadPitch", False)[0],
-                "sonarLeft": sl,
-                "sonarRight": sr,
-                "ballFound": False,
-                "ballBx": 0.0,
-                "ballBy": 0.0,
-                "ballBsz": 0.0,
+                "sonarLeft": sl, "sonarRight": sr,
+                "ballFound": self.ball_model.valid,
+                "ballBx":    self.ball_model.bx,
+                "ballBy":    self.ball_model.by,
+                "ballBsz":   self.ball_model.bsz,
             }
-
-            data = self.memory.getData("redBallDetected")
-            if data and len(data) >= 2:
-                info = data[1]
-                snapshot["ballFound"] = True
-                snapshot["ballBx"] = float(info[0])
-                snapshot["ballBy"] = float(info[1])
-                snapshot["ballBsz"] = float(info[2])
-
             self.data_logger.update_telemetry(snapshot)
         except Exception:
             pass
 
-    # ─── Bounds Check ───────────────────────
     def _is_in_bounds(self, x, y):
         with self.lock:
             dx = x - self.origin_x
             dy = y - self.origin_y
             fm = self.field_map.copy()
-        dist = math.sqrt(dx * dx + dy * dy)
+        dist = math.sqrt(dx*dx + dy*dy)
         if dist > MAX_FIELD_RADIUS:
             return False
-        angle = math.atan2(dy, dx) * (180.0 / math.pi)
+        angle  = math.atan2(dy, dx) * (180.0 / math.pi)
         sector = int(angle / 30.0) * 30
         if sector in fm and dist > fm[sector] * 0.85:
             return False
@@ -524,19 +879,16 @@ class BotFCBrain(object):
             if not self._is_in_bounds(p[0], p[1]):
                 self.motion.stopMove()
                 self.leds.fadeRGB("AllLeds", 0xFF00FF, 0.15)
-                target_angle = math.atan2(
-                    self.origin_y - p[1], self.origin_x - p[0])
-                turn = target_angle - p[2]
-                while turn > math.pi:
-                    turn -= 2.0 * math.pi
-                while turn < -math.pi:
-                    turn += 2.0 * math.pi
+                target = math.atan2(self.origin_y - p[1], self.origin_x - p[0])
+                turn = target - p[2]
+                while turn >  math.pi: turn -= 2.0 * math.pi
+                while turn < -math.pi: turn += 2.0 * math.pi
                 self.motion.moveTo(0.0, 0.0, turn)
                 self.motion.moveTo(0.3, 0.0, 0.0)
         except Exception:
             pass
 
-    # ─── Safety / Overheat ──────────────────
+    # ─── Safety / overheat ──────────────────
     def _safety_check(self):
         try:
             temps = [float(self.memory.getData(k)) for k in self.temp_keys]
@@ -555,16 +907,13 @@ class BotFCBrain(object):
             self.overheat_count = 0
         self.last_overheat_time = now
 
-        cd = 60 + (self.overheat_count * 30)
+        cd   = 60 + self.overheat_count * 30
         mins = cd // 60
         secs = cd % 60
-
         if mins > 0:
-            phrase = "Motors at {}. I need a {} minute break.".format(
-                int(max_t), mins)
+            phrase = "Motors at {}. I need a {} minute break.".format(int(max_t), mins)
         else:
-            phrase = "Motors at {}. I need a {} second break.".format(
-                int(max_t), secs)
+            phrase = "Motors at {}. I need a {} second break.".format(int(max_t), secs)
 
         self.tts.post.say(phrase)
         self.leds.fadeRGB("AllLeds", 0xFFA200, 0.15)
@@ -593,44 +942,68 @@ class BotFCBrain(object):
             with self.lock:
                 self.state = STATE_SEARCH
 
-    # ─── doSearch ───────────────────────────
+    # ─── SEARCH ─────────────────────────────
     def _do_search(self):
         self._update_local_map()
         self.leds.fadeRGB("AllLeds", 0xFF3300, 0.15)
 
-        try:
-            data = self.memory.getData("redBallDetected")
-            if data and len(data) >= 2:
+        # Try both cameras.  _read_ball() guards against stale NAOqi cache.
+        ball = self._get_ball_and_update_model()
+
+        if ball is not None:
+            # Freeze head at its current yaw so the next frame is taken with
+            # a stationary camera (eliminates motion-blur ghost detections).
+            try:
+                cy = self.motion.getAngles("HeadYaw", False)[0]
+                self.motion.setAngles("HeadYaw", cy, 0.3)
+            except Exception:
+                pass
+            time.sleep(0.08)
+
+            # Re-verify: a second fresh detection within 80 ms confirms the
+            # ball is truly visible (not a single-frame noise spike).
+            ball2 = self._get_ball_and_update_model()
+            if ball2 is not None:
                 self.motion.stopMove()
                 with self.lock:
                     self.last_ball_time = time.time()
                     self.state = STATE_APPROACH
-                self.motion.setAngles("HeadPitch", 0.0, 0.2)
-                self.motion.setAngles("HeadYaw", 0.0, 0.2)
+                self.motion.setAngles("HeadPitch", 0.15, 0.2)
                 self.tts.post.say("Ball found!")
                 return
-        except Exception:
-            pass
+            # Single-frame ghost: fall through and keep sweeping.
 
-        self.search_yaw += self.search_yaw_dir * 0.15
-        if self.search_yaw > 1.0:
-            self.search_yaw = 1.0
+        # ── Sweep with heading memory ──────────────────────────────────────
+        # On the first sweep cycle after losing the ball, seed the head yaw
+        # to the last known ball heading so we search there first.
+        if (self.search_yaw == 0.0 and self.search_yaw_dir == 1.0
+                and self.ball_model.last_heading != 0.0):
+            seeded = max(-1.0, min(1.0, -self.ball_model.last_heading))
+            self.search_yaw = seeded
+
+        # 0.06 rad/step at 50 ms/cycle ≈ 1.2 rad/s – slow enough for the
+        # camera to fire a detection event as the ball passes through the FOV.
+        self.search_yaw += self.search_yaw_dir * 0.06
+        if self.search_yaw >= 1.0:
+            self.search_yaw    = 1.0
             self.search_yaw_dir = -1.0
-        elif self.search_yaw < -1.0:
-            self.search_yaw = -1.0
+        elif self.search_yaw <= -1.0:
+            self.search_yaw    = -1.0
             self.search_yaw_dir = 1.0
 
-        self.motion.setAngles("HeadYaw", self.search_yaw, 0.2)
-        self.motion.setAngles("HeadPitch", 0.15, 0.2)
+        self.motion.setAngles("HeadYaw",   self.search_yaw, 0.15)
+        # Pitch down enough to see the ball on the floor (~14° = 0.25 rad).
+        self.motion.setAngles("HeadPitch", 0.25, 0.15)
 
         with self.lock:
             ltime = self.last_ball_time
         if time.time() - ltime > 15.0:
+            # Been searching a long time – rotate body slowly to cover ground.
             self.motion.moveToward(0.0, 0.0, 0.2)
         else:
             self.motion.stopMove()
 
-    # ─── doApproach ─────────────────────────
+    # ─── APPROACH ───────────────────────────
     def _do_approach(self):
         self._update_local_map()
         self.leds.fadeRGB("AllLeds", 0x00FF00, 0.15)
@@ -641,20 +1014,13 @@ class BotFCBrain(object):
             self.tts.post.say("Man on, man on")
             self.last_man_on_time = now
 
-        found = False
-        bx = by = bsz = 0.0
-        try:
-            data = self.memory.getData("redBallDetected")
-            if data and len(data) >= 2:
-                found = True
-                info = data[1]
-                bx = float(info[0])
-                by = float(info[1])
-                bsz = float(info[2])
-        except Exception:
-            pass
+        # Update model if a fresh reading exists.
+        self._get_ball_and_update_model()
 
-        if not found:
+        # KEY: only drop to SEARCH when the model itself expires (BALL_LOSS_TIME
+        # seconds of no detections).  A single missed camera frame is NOT enough
+        # to abort the approach – that's what caused the jittery search loops.
+        if not self.ball_model.valid:
             with self.lock:
                 self.state = STATE_SEARCH
             return
@@ -662,12 +1028,30 @@ class BotFCBrain(object):
         with self.lock:
             self.last_ball_time = now
 
+        bx  = self.ball_model.bx
+        bsz = self.ball_model.bsz
+        dist = self.ball_model.dist
+
+        # ── Head tracking ──────────────────────────────────────────────────
+        # Servo the head to chase bx so the head encoder always reflects the
+        # true ball direction.  We then drive the body from head_yaw (joint
+        # encoder, zero lag) rather than from bx (camera, up to 100 ms lag).
+        head_yaw = 0.0
+        try:
+            head_yaw = self.motion.getAngles("HeadYaw", False)[0]
+            # NAO: positive HeadYaw = head left.  bx > 0 = ball right of frame
+            # → decrease yaw to track right.
+            target_yaw = max(-1.0, min(1.0, head_yaw - bx * HEAD_TRACK_GAIN))
+            self.motion.setAngles("HeadYaw", target_yaw, 0.4)
+            head_yaw = target_yaw
+        except Exception:
+            pass
+
+        # ── Sonar obstacle check ───────────────────────────────────────────
         sl = sr = 9.0
         try:
-            sl = float(self.memory.getData(
-                "Device/SubDeviceList/US/Left/Sensor/Value"))
-            sr = float(self.memory.getData(
-                "Device/SubDeviceList/US/Right/Sensor/Value"))
+            sl = float(self.memory.getData("Device/SubDeviceList/US/Left/Sensor/Value"))
+            sr = float(self.memory.getData("Device/SubDeviceList/US/Right/Sensor/Value"))
         except Exception:
             pass
         min_sonar = min(sl, sr)
@@ -678,40 +1062,59 @@ class BotFCBrain(object):
                 self.state = STATE_TACKLE
             return
 
-        if bsz > 0.08:
+        # ── State transitions ──────────────────────────────────────────────
+        if bsz >= KICK_BSZ_READY:
+            # Ball is large and (approximately) centred – go straight to ALIGN.
             self.motion.stopMove()
+            self.motion.setAngles("HeadYaw", 0.0, 0.2)
             with self.lock:
                 self.state = STATE_ALIGN
             return
 
-        turn = max(-0.6, min(0.6, -bx * 3.0))
-        speed = max(0.2, min(0.7, 0.6 * (1.0 - min(bsz / 0.08, 0.8))))
-        self.motion.moveToward(speed, 0.0, turn)
+        # ── Body motion ────────────────────────────────────────────────────
+        # If the head had to turn significantly to find the ball, rotate the
+        # body first so the head re-centres.  This eliminates the odometry
+        # drift that caused the robot to walk past the ball.
+        if abs(head_yaw) > BODY_FOLLOW_THRESHOLD:
+            body_turn = max(-0.5, min(0.5, head_yaw * 1.5))
+            self.motion.moveToward(0.1, 0.0, body_turn)
+        else:
+            # Walking straight – nudge head back to centre so head and body
+            # remain aligned during forward motion.  Low speed (0.10) avoids
+            # jerky correction; the ball tracker will re-acquire the offset.
+            self.motion.setAngles("HeadYaw", 0.0, 0.10)
+            # Scale walk speed by estimated distance: fast when far, slow when close.
+            speed = max(0.2, min(0.7, (dist - KICK_APPROACH_DIST) * 0.6))
+            self.motion.moveToward(speed, 0.0, 0.0)
 
-    # ─── doAlign ────────────────────────────
+    # ─── ALIGN ──────────────────────────────
     def _do_align(self):
         self._update_local_map()
         self.leds.fadeRGB("AllLeds", 0x00FF00, 0.15)
-        self.motion.setAngles("HeadPitch", 0.3, 0.3)
+
+        # Raise head pitch so ball falls inside the bottom camera FOV –
+        # this eliminates the blind spot between the two cameras.
+        self.motion.setAngles("HeadPitch", 0.45, 0.3)
 
         now = time.time()
         if now - self.last_man_on_time > 4.0:
             self.tts.post.say("Man on, man on")
             self.last_man_on_time = now
 
-        found = False
-        bx = bsz = 0.0
-        try:
-            data = self.memory.getData("redBallDetected")
-            if data and len(data) >= 2:
-                found = True
-                info = data[1]
-                bx = float(info[0])
-                bsz = float(info[2])
-        except Exception:
-            pass
+        # In ALIGN we prioritise the bottom camera but still accept top-cam data.
+        ball = self._detect_bottom_cam()
+        if ball is None:
+            ball = self._read_ball()
 
-        if not found:
+        if ball is not None:
+            bx, by, bsz = ball
+            try:
+                head_yaw = self.motion.getAngles("HeadYaw", False)[0]
+            except Exception:
+                head_yaw = 0.0
+            self.ball_model.update(bx, by, bsz, head_yaw)
+
+        if not self.ball_model.valid:
             self.motion.stopMove()
             with self.lock:
                 self.state = STATE_SEARCH
@@ -720,114 +1123,150 @@ class BotFCBrain(object):
         with self.lock:
             self.last_ball_time = now
 
+        bx  = self.ball_model.bx
+        bsz = self.ball_model.bsz
+
+        # ── Sonar check ───────────────────────────────────────────────────
         sl = sr = 9.0
         try:
-            sl = float(self.memory.getData(
-                "Device/SubDeviceList/US/Left/Sensor/Value"))
-            sr = float(self.memory.getData(
-                "Device/SubDeviceList/US/Right/Sensor/Value"))
+            sl = float(self.memory.getData("Device/SubDeviceList/US/Left/Sensor/Value"))
+            sr = float(self.memory.getData("Device/SubDeviceList/US/Right/Sensor/Value"))
         except Exception:
             pass
-        min_sonar = min(sl, sr)
-
-        if min_sonar <= COMBAT_DISTANCE:
+        if min(sl, sr) <= COMBAT_DISTANCE:
             self.motion.stopMove()
             with self.lock:
                 self.state = STATE_TACKLE
             return
 
-        if abs(bx) < 0.05 and bsz > 0.10:
+        # ── Kick-ready transition ─────────────────────────────────────────
+        if abs(bx) < KICK_BX_MAX and bsz > KICK_BSZ_READY:
             self.motion.stopMove()
             self.tts.post.say("I see the goal")
             with self.lock:
                 self.state = STATE_KICK
             return
 
-        if abs(bx) > 0.03:
-            lateral = -bx * 0.15
-            turn = -bx * 0.8
-            self.motion.moveToward(0.1, lateral, turn)
+        # ── Alignment corrections (with dead-band to kill oscillation) ────
+        if abs(bx) > ALIGN_BODY_DEADBAND:
+            lateral = -bx * 0.10    # gentle lateral shuffle
+            turn    = -bx * 0.65    # body rotation to re-centre
+            self.motion.moveToward(0.08, lateral, turn)
+        elif bsz < 0.15:
+            # Well-centred but not yet close enough – creep forward.
+            self.motion.moveToward(0.10, 0.0, 0.0)
         else:
-            self.motion.moveToward(0.15, 0.0, 0.0)
+            # Very close and centred – hold still, let kick transition fire.
+            self.motion.stopMove()
 
-    # ─── doTackle ───────────────────────────
+    # ─── TACKLE ─────────────────────────────
     def _do_tackle(self):
         self.leds.fadeRGB("AllLeds", 0xFF0000, 0.15)
         try:
             self.tts.post.say("Pushing!")
             self.motion.setStiffnesses("Body", 1.0)
             self.posture.goToPosture("StandInit", 0.8)
-
-            self.motion.setAngles(
-                ["LShoulderPitch", "RShoulderPitch"], [0.0, 0.0], 0.3)
-            self.motion.setAngles(
-                ["LKneePitch", "RKneePitch"], [0.4, 0.4], 0.3)
-
+            self.motion.setAngles(["LShoulderPitch", "RShoulderPitch"], [0.0, 0.0], 0.3)
+            self.motion.setAngles(["LKneePitch",     "RKneePitch"],     [0.4, 0.4], 0.3)
             time.sleep(0.5)
-
             self.motion.moveToward(1.0, 0.0, 0.0)
             time.sleep(2.0)
             self.motion.stopMove()
-
-            self.motion.setAngles(
-                ["LShoulderPitch", "RShoulderPitch"], [1.5, 1.5], 0.4)
+            self.motion.setAngles(["LShoulderPitch", "RShoulderPitch"], [1.5, 1.5], 0.4)
             self.posture.goToPosture("StandInit", 0.8)
         except Exception:
             pass
-
         with self.lock:
             self.state = STATE_SEARCH
 
-    # ─── doKick ─────────────────────────────
+    # ─── KICK ───────────────────────────────
     def _do_kick(self):
         self.leds.fadeRGB("AllLeds", 0x0000FF, 0.15)
         self.motion.stopMove()
-        self.motion.setAngles("HeadPitch", 0.35, 0.5)
-        time.sleep(0.2)
 
-        found = False
-        bx = 0.0
-        try:
-            data = self.memory.getData("redBallDetected")
-            if data and len(data) >= 2:
-                info = data[1]
-                found = True
-                bx = float(info[0])
-        except Exception:
-            pass
+        # Raise head pitch to use the bottom camera's FOV, eliminating the
+        # blind spot between the two cameras when the ball is at the feet.
+        self.motion.setAngles("HeadYaw",   0.0,  0.3)
+        self.motion.setAngles("HeadPitch", 0.52, 0.5)
+        time.sleep(0.25)   # let robot settle before sampling
 
-        if not found:
+        # ── Kick walk-up ──────────────────────────────────────────────────
+        # If the ball appears smaller than expected (robot stopped a bit far),
+        # walk forward slowly until the ball fills the frame.  This mimics
+        # the B-Human "walk-up to ball" before an in-walk kick.
+        for _ in range(8):
+            ball = self._detect_bottom_cam()
+            if ball is None:
+                ball_r = self._read_ball()
+                if ball_r:
+                    ball = ball_r
+            if ball is not None:
+                _, _, bsz = ball
+                if bsz >= KICK_BSZ_READY * 1.4:
+                    break          # close enough to kick
+                self.motion.moveTo(0.05, 0.0, 0.0)   # 5 cm step forward
+                time.sleep(0.3)
+            else:
+                break
+
+        self.motion.stopMove()
+        time.sleep(0.1)
+
+        # ── Multi-sample verification ─────────────────────────────────────
+        # Collect KICK_VERIFY_SAMPLES fresh readings.  Because _read_ball()
+        # advances _last_ball_ts, each sample must have a new NAOqi timestamp –
+        # stale cache is never counted.  Bottom-cam samples are also accepted.
+        bx_samples = []
+        for _ in range(KICK_VERIFY_SAMPLES):
+            ball = self._detect_bottom_cam()
+            if ball is None:
+                ball = self._read_ball()
+            if ball is not None:
+                bx_samples.append(ball[0])
+            time.sleep(KICK_VERIFY_INTERVAL)
+
+        if len(bx_samples) < 2:
+            # Ball not reliably in view – go back to ALIGN for another attempt.
             with self.lock:
-                self.state = STATE_SEARCH
+                self.state = STATE_ALIGN
             return
 
+        # Median of samples to reject single-frame noise spikes.
+        bx_samples.sort()
+        bx = bx_samples[len(bx_samples) // 2]
+
+        # ── Select kick foot ──────────────────────────────────────────────
+        # bx < 0: ball is left of centre → kick with left foot (L).
+        # bx > 0: ball is right → kick with right foot (R).
         side_step_y = -0.04 if bx < -0.02 else 0.04
-        kick_leg = "L" if bx < -0.02 else "R"
+        kick_leg    = "L"   if bx < -0.02 else "R"
 
         self.tts.post.say("Kick!")
 
         try:
             self.posture.goToPosture("Stand", 0.8)
             time.sleep(0.2)
+            # Step laterally to plant the support foot cleanly.
             self.motion.moveTo(0.0, side_step_y, 0.0)
-            time.sleep(0.2)
+            time.sleep(0.15)
 
             if kick_leg == "R":
-                hip = "RHipPitch"
-                knee = "RKneePitch"
-                support_roll = "LHipRoll"
+                hip = "RHipPitch"; knee = "RKneePitch"; roll = "LHipRoll"
             else:
-                hip = "LHipPitch"
-                knee = "LKneePitch"
-                support_roll = "RHipRoll"
+                hip = "LHipPitch"; knee = "LKneePitch"; roll = "RHipRoll"
 
-            self.motion.setAngles(support_roll, 0.15, 0.4)
-            time.sleep(0.3)
-            self.motion.setAngles(hip, -0.4, 0.5)
-            time.sleep(0.2)
-            self.motion.setAngles(hip, 0.8, 1.0)
-            self.motion.setAngles(knee, -0.7, 1.0)
-            time.sleep(0.3)
+            # angleInterpolation gives precise absolute timing (seconds) rather
+            # than a speed fraction – the same technique B-Human uses for kicks.
+            # Times are cumulative seconds from "now".
+            # Phase 1 (0.0→0.25 s): shift weight onto support leg.
+            # Phase 2 (0.25→0.45 s): wind-up (pull knee back).
+            # Phase 3 (0.45→0.75 s): strike (snap forward + extend knee).
+            self.motion.angleInterpolation(
+                [roll,  hip,   hip,   knee ],
+                [0.15, -0.45,  0.85, -0.75],
+                [0.25,  0.45,  0.75,  0.75],
+                True   # isAbsolute
+            )
 
             self.posture.goToPosture("Stand", 0.8)
             with self.lock:
@@ -843,7 +1282,7 @@ class BotFCBrain(object):
 
 
 # ─────────────────────────────────────────────
-# Main Entry Point (from brain_main.cpp)
+# Main Entry Point
 # ─────────────────────────────────────────────
 g_brain = None
 
@@ -860,30 +1299,24 @@ def main():
     global g_brain
 
     parser = argparse.ArgumentParser(description="BotFC Python Brain")
-    parser.add_argument("--ip", default="127.0.0.1",
-                        help="Robot IP (default: 127.0.0.1)")
-    parser.add_argument("--pip", default=None,
-                        help="Robot IP (alias for --ip)")
-    parser.add_argument("--pport", type=int, default=9559,
-                        help="Robot port (default: 9559)")
-    parser.add_argument("--trait", default="balanced",
-                        help="Player trait: offense, defense, balanced")
-    parser.add_argument("--server-ip", default="127.0.0.1",
-                        help="BotFC API server IP")
-    parser.add_argument("--server-port", type=int, default=5050,
-                        help="BotFC API server port")
+    parser.add_argument("--ip",          default="127.0.0.1", help="Robot IP")
+    parser.add_argument("--pip",         default=None,        help="Robot IP (alias)")
+    parser.add_argument("--pport",       type=int, default=9559, help="Robot port")
+    parser.add_argument("--trait",       default="balanced",  help="offense / defense / balanced")
+    parser.add_argument("--server-ip",   default="127.0.0.1", help="BotFC API server IP")
+    parser.add_argument("--server-port", type=int, default=5050, help="BotFC API server port")
     args = parser.parse_args()
 
-    robot_ip = args.pip if args.pip else args.ip
+    robot_ip   = args.pip if args.pip else args.ip
     robot_port = args.pport
 
-    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGINT,  signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
     print("=" * 50)
-    print("  Bot FC – Python Brain")
-    print("  Robot: {}:{}".format(robot_ip, robot_port))
-    print("  Trait: {}".format(args.trait))
+    print("  Bot FC – Python Brain (Enhanced Edition)")
+    print("  Robot:  {}:{}".format(robot_ip, robot_port))
+    print("  Trait:  {}".format(args.trait))
     print("  Server: {}:{}".format(args.server_ip, args.server_port))
     print("=" * 50)
 
@@ -892,7 +1325,6 @@ def main():
     g_brain = brain
     brain.start()
 
-    # Block forever (like the C++ while(true) sleep loop)
     try:
         while True:
             time.sleep(1)

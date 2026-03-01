@@ -16,13 +16,20 @@ public:
   HttpServer(boost::asio::io_context &ioc, unsigned short port);
   void start();
 
-  // Broadcast message to all connected frontend websockets
+  // Telemetry (bot → server → frontend)
   void broadcastTelemetry(const std::string &msg);
   void updateTelemetry(const nlohmann::json &payload);
   nlohmann::json getTelemetry();
 
   void addFrontendSession(std::shared_ptr<WsSession> session);
   void removeFrontendSession(std::shared_ptr<WsSession> session);
+
+  // Camera feed (bot_camera → server → camera_feed browsers)
+  void addCameraViewerSession(std::shared_ptr<WsSession> session);
+  void removeCameraViewerSession(std::shared_ptr<WsSession> session);
+  void setLatestFrame(const std::string &frame_json);
+  std::string getLatestFrame();
+  void broadcastFrame(const std::string &frame_json);
 
   void setRobotIp(const std::string &ip);
   std::string getRobotIp();
@@ -35,8 +42,10 @@ private:
 
   std::mutex mutex_;
   std::set<std::shared_ptr<WsSession>> frontend_sessions_;
+  std::set<std::shared_ptr<WsSession>> camera_sessions_;
 
   nlohmann::json latest_telemetry_;
+  std::string latest_frame_; // latest camera frame JSON from bot
   std::string robot_ip_;
 
   friend class HttpSession;
