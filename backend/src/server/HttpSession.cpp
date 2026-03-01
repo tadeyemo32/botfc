@@ -32,8 +32,16 @@ void HttpSession::onRead(beast::error_code ec, std::size_t bytes_transferred) {
     return;
 
   if (websocket::is_upgrade(req_)) {
-    bool is_frontend = (req_.target() == "/api/ws/frontend");
-    std::make_shared<WsSession>(stream_.release_socket(), server_, is_frontend)
+    auto target = std::string(req_.target());
+    std::string role = "bot";
+    if (target == "/api/ws/frontend")
+      role = "frontend";
+    else if (target == "/api/ws/bot_camera")
+      role = "bot_camera";
+    else if (target == "/api/ws/camera_feed")
+      role = "camera_feed";
+
+    std::make_shared<WsSession>(stream_.release_socket(), server_, role)
         ->doAccept(std::move(req_));
     return;
   }
@@ -105,6 +113,28 @@ void HttpSession::handleRequest() {
       }
     }).detach();
     res.body() = "{\"status\": \"stopped\"}";
+  } else if (method == http::verb::get && target == "/api/camera/frame") {
+    // Returns the latest JPEG frame JSON sent by the robot's CameraStreamer.
+    // Returns {"frame": null} when no frame has arrived yet.
+    std::string f = server_.getLatestFrame();
+    if (f.empty()) {
+      res.body() = "{\"frame\": null}";
+    } else {
+      res.body() = f;
+    }
+  } else if (method == http::verb::post && target == "/api/vision/ball") {
+    // host_vision.py posts detected ball coordinates from the host machine.
+    auto j = nlohmann::json::parse(req_.body(), nullptr, false);
+    if (!j.is_discarded()) {
+      nlohmann::json patch;
+      patch["host_ball_valid"] = true;
+      if (j.contains("bx"))  patch["host_ball_bx"]  = j["bx"];
+      if (j.contains("by"))  patch["host_ball_by"]  = j["by"];
+      if (j.contains("bsz")) patch["host_ball_bsz"] = j["bsz"];
+      server_.updateTelemetry(patch);
+      server_.broadcastTelemetry(server_.getTelemetry().dump());
+    }
+    res.body() = "{\"status\": \"ok\"}";
   } else {
     res.result(http::status::not_found);
   }

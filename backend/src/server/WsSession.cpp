@@ -6,8 +6,8 @@ namespace websocket = beast::websocket;
 namespace net = boost::asio;
 
 WsSession::WsSession(net::ip::tcp::socket &&socket, HttpServer &server,
-                     bool is_frontend)
-    : ws_(std::move(socket)), server_(server), is_frontend_(is_frontend) {}
+                     const std::string &role)
+    : ws_(std::move(socket)), server_(server), role_(role) {}
 
 void WsSession::write(const std::string &msg) {
   auto self = shared_from_this();
@@ -25,29 +25,40 @@ void WsSession::doRead() {
 
 void WsSession::onRead(beast::error_code ec, std::size_t bytes_transferred) {
   boost::ignore_unused(bytes_transferred);
+
+  auto cleanup = [&]() {
+    if (role_ == "frontend")
+      server_.removeFrontendSession(shared_from_this());
+    else if (role_ == "camera_feed")
+      server_.removeCameraViewerSession(shared_from_this());
+  };
+
   if (ec == websocket::error::closed) {
-    if (is_frontend_)
-      server_.removeFrontendSession(shared_from_this());
+    cleanup();
     return;
   }
-
   if (ec) {
-    if (is_frontend_)
-      server_.removeFrontendSession(shared_from_this());
+    cleanup();
     return;
   }
 
-  if (!is_frontend_) {
-    // It's the bot! Parse its JSON telemetry
-    std::string msg = beast::buffers_to_string(buffer_.data());
+  std::string msg = beast::buffers_to_string(buffer_.data());
+  buffer_.consume(buffer_.size());
+
+  if (role_ == "bot") {
+    // Bot telemetry JSON → store and fan-out to frontend sessions
     try {
       auto j = nlohmann::json::parse(msg);
       server_.updateTelemetry(j);
       server_.broadcastTelemetry(msg);
     } catch (...) {
     }
+  } else if (role_ == "bot_camera") {
+    // Camera frame JSON from robot → store + relay to camera viewer sessions
+    server_.setLatestFrame(msg);
+    server_.broadcastFrame(msg);
   }
+  // "frontend" and "camera_feed" sessions only receive; ignore their messages.
 
-  buffer_.consume(buffer_.size());
   doRead();
 }

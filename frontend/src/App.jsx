@@ -1,5 +1,56 @@
 import { useState, useEffect, useRef } from "react";
 
+function CameraFeed() {
+  const [frame, setFrame] = useState(null);
+  const [connected, setConnected] = useState(false);
+  const ws = useRef(null);
+
+  useEffect(() => {
+    const connect = () => {
+      ws.current = new WebSocket("ws://localhost:5050/api/ws/camera_feed");
+      ws.current.onopen = () => setConnected(true);
+      ws.current.onclose = () => { setConnected(false); setTimeout(connect, 2000); };
+      ws.current.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.type === "frame" && data.jpg) setFrame(data.jpg);
+        } catch (_) {}
+      };
+    };
+    connect();
+    return () => ws.current?.close();
+  }, []);
+
+  return (
+    <div style={{
+      background: "rgba(0,10,5,0.95)",
+      border: `1px solid ${connected ? "#4d9fff40" : "#1a3a2a"}`,
+      borderTop: `3px solid ${connected ? "#4d9fff" : "#1a3a2a"}`,
+      padding: "0.6rem",
+      fontFamily: "'Share Tech Mono', monospace",
+    }}>
+      <div style={{ fontSize: "0.55rem", letterSpacing: "0.2em", color: "#4d9fff", marginBottom: "0.4rem", display: "flex", justifyContent: "space-between" }}>
+        <span>BOT CAM · POV</span>
+        <span style={{ color: connected ? "#4d9fff" : "#ff4d4d" }}>{connected ? "LIVE" : "NO SIGNAL"}</span>
+      </div>
+      <div style={{ width: "100%", aspectRatio: "4/3", background: "#000", position: "relative", overflow: "hidden" }}>
+        {frame ? (
+          <img
+            src={`data:image/jpeg;base64,${frame}`}
+            alt="bot pov"
+            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }}
+          />
+        ) : (
+          <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#1a3a2a", fontSize: "0.6rem", letterSpacing: "0.2em" }}>
+            AWAITING STREAM
+          </div>
+        )}
+        <div style={{ position: "absolute", top: 4, left: 4, width: 6, height: 6, borderRadius: "50%", background: connected ? "#4d9fff" : "#1a3a2a", boxShadow: connected ? "0 0 8px #4d9fff" : "none" }} />
+      </div>
+    </div>
+  );
+}
+
 function TelemetryHUD() {
   const [telemetry, setTelemetry] = useState({
     state: "IDLE",
@@ -8,6 +59,7 @@ function TelemetryHUD() {
     break_remaining: 0,
     trait: "none",
     robot_connected: false,
+    battery_pct: -1,
   });
   const [connected, setConnected] = useState(false);
   const [robotIp, setRobotIp] = useState("");
@@ -146,6 +198,28 @@ function TelemetryHUD() {
             {testing ? "..." : "SYNC"}
           </button>
         </div>
+      </div>
+
+      {/* Battery bar */}
+      {(() => {
+        const pct = telemetry.battery_pct;
+        const batColor = pct < 0 ? "#1a3a2a" : pct <= 20 ? "#ff4d4d" : pct <= 40 ? "#ffcc00" : "#a8ff4d";
+        return (
+          <div style={{ marginBottom: "0.8rem" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.6rem", color: "#4d7a60", marginBottom: "0.3rem" }}>
+              <span>BATTERY</span>
+              <span style={{ color: batColor }}>{pct < 0 ? "N/A" : `${pct}%`}</span>
+            </div>
+            <div style={{ height: 6, background: "#0a1a10", borderRadius: 2, overflow: "hidden" }}>
+              <div style={{ height: "100%", width: `${Math.max(0, pct)}%`, background: batColor, transition: "width 1s ease, background 0.5s ease", boxShadow: pct > 0 ? `0 0 6px ${batColor}80` : "none" }} />
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* Camera feed */}
+      <div style={{ marginBottom: "0.8rem" }}>
+        <CameraFeed />
       </div>
 
       <div style={{ marginBottom: "1rem" }}>
