@@ -483,11 +483,12 @@ class MLDataLogger(object):
 # CameraStreamer – JPEG frames via WS to server
 # ─────────────────────────────────────────────
 class CameraStreamer(object):
-    """Grabs JPEG frames from NAOqi and streams them to the C++ server via
+    """Grabs JPEG frames from NAOqi and streams them to the server via
     WebSocket /api/ws/bot_camera.  The server stores the latest frame and
     relays it to browser clients on /api/ws/camera_feed.
 
-    Uses kJpegColorSpace=21 so no re-encoding is needed on the robot.
+    Tries kJpegColorSpace=21 first; falls back to kRGBColorSpace=11 if
+    the firmware rejects it, encoding to JPEG via PIL.
     """
 
     def __init__(self, robot_ip, robot_port, server_host, server_port):
@@ -499,23 +500,47 @@ class CameraStreamer(object):
         self.thread      = None
         self._vid        = None
         self._cam_client = ""
+        self._fmt        = STREAM_CAM_FORMAT  # 21=kJpeg, 11=kRGB
 
     def start(self):
         if self.running:
             return
         try:
             self._vid = ALProxy("ALVideoDevice", self.robot_ip, self.robot_port)
-            self._cam_client = self._vid.subscribeCamera(
-                "BotFC_Stream", STREAM_CAM_ID, STREAM_CAM_RES,
-                STREAM_CAM_FORMAT, STREAM_CAM_FPS)
         except Exception as e:
-            print("[CamStream] Camera init failed: {}".format(e))
+            print("[CamStream] ALVideoDevice unavailable: {}".format(e))
             return
+
+        # Clean up any stale subscription from a previous crashed run
+        try:
+            self._vid.unsubscribe("BotFC_Stream")
+        except Exception:
+            pass
+
+        # Try kJpegColorSpace first, fall back to kRGBColorSpace
+        handle = None
+        for fmt, label in ((21, "kJpeg"), (11, "kRGB")):
+            try:
+                handle = self._vid.subscribeCamera(
+                    "BotFC_Stream", STREAM_CAM_ID, STREAM_CAM_RES,
+                    fmt, STREAM_CAM_FPS)
+                if handle:
+                    self._fmt = fmt
+                    print("[CamStream] subscribeCamera OK with {} (fmt={})".format(label, fmt))
+                    break
+            except Exception as sub_e:
+                print("[CamStream] subscribeCamera fmt={} failed: {}".format(fmt, sub_e))
+
+        if not handle:
+            print("[CamStream] Could not subscribe to camera – aborting.")
+            return
+
+        self._cam_client = handle
         self.running = True
         self.thread  = threading.Thread(target=self._loop)
         self.thread.daemon = True
         self.thread.start()
-        print("[CamStream] Started JPEG stream to {}:{}.".format(
+        print("[CamStream] Started stream to {}:{}.".format(
             self.server_host, self.server_port))
 
     def stop(self):
@@ -528,9 +553,37 @@ class CameraStreamer(object):
             except Exception:
                 pass
 
+    def _to_jpeg(self, img):
+        """Return (jpg_bytes_as_str, w, h) or (None, 0, 0) on bad frame."""
+        if not img or len(img) <= 6:
+            return None, 0, 0
+        w, h, raw = int(img[0]), int(img[1]), img[6]
+        if not raw:
+            return None, w, h
+        if self._fmt == 21:   # kJpegColorSpace: img[6] is already JPEG bytes
+            jpg = bytes(bytearray(raw))
+            ba = bytearray(jpg)
+            if len(ba) < 3 or ba[0] != 0xff or ba[1] != 0xd8:
+                return None, w, h   # corrupt frame
+            return jpg, w, h
+        # kRGBColorSpace (11): encode via PIL
+        try:
+            import StringIO as _sio
+            from PIL import Image as _Img
+            rgb     = bytes(bytearray(raw))
+            pil_img = _Img.frombytes("RGB", (w, h), rgb)
+            buf     = _sio.StringIO()
+            pil_img.save(buf, format="JPEG", quality=70)
+            return buf.getvalue(), w, h
+        except Exception as enc_e:
+            print("[CamStream] PIL encode error: {}".format(enc_e))
+            return None, w, h
+
     def _loop(self):
         import socket as _socket
         import base64 as _b64
+
+        bad_frames = 0
 
         while self.running:
             sock = None
@@ -560,22 +613,37 @@ class CameraStreamer(object):
                     resp += chunk
 
                 if b"101" not in resp.split(b"\r\n")[0]:
-                    raise Exception("WS upgrade rejected")
+                    raise Exception("WS upgrade rejected: " + repr(resp[:200]))
+
+                # Remove timeout for the streaming phase so large frames
+                # do not abort the connection
+                sock.settimeout(None)
 
                 print("[CamStream] Connected.")
-
+                bad_frames = 0
                 interval = 1.0 / STREAM_CAM_FPS
+
                 while self.running:
+                    t0 = time.time()
                     img = self._vid.getImageRemote(self._cam_client)
-                    if img and len(img) > 6:
-                        w   = int(img[0])
-                        h   = int(img[1])
-                        jpg = bytes(bytearray(img[6]))
+                    jpg, w, h = self._to_jpeg(img)
+                    if jpg:
                         b64 = _b64.b64encode(jpg).decode("ascii")
                         payload = json.dumps({"type": "frame", "w": w, "h": h, "jpg": b64})
                         TelemetryClient._ws_send(sock, payload)
+                        bad_frames = 0
+                    else:
+                        bad_frames += 1
+                        if bad_frames % 20 == 1:
+                            print("[CamStream] {} bad/empty frames so far".format(bad_frames))
+                    try:
                         self._vid.releaseImage(self._cam_client)
-                    time.sleep(interval)
+                    except Exception:
+                        pass
+                    elapsed = time.time() - t0
+                    remaining = interval - elapsed
+                    if remaining > 0:
+                        time.sleep(remaining)
 
                 TelemetryClient._ws_close(sock)
             except Exception as e:
