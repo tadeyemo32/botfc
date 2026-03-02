@@ -29,7 +29,7 @@ This system enables autonomous capabilities including object detection, tracking
 
 ## Technology Stack
 
-- Language: Python
+- Language: Python,C++,Javascript,bash
 - Primary Libraries:
   - TensorFlow: Deep learning framework
   - OpenCV: Computer vision library
