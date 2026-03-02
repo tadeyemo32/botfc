@@ -1,97 +1,137 @@
 # BotFC - Intelligent Autonomous Humanoid Robotics
 
-An end-to-end intelligent perception and control system designed for the NAO humanoid robot platform. BotFC integrates real-time computer vision, physics simulation, and a custom-built low-latency C++ machine learning engine to achieve autonomous robotic capabilities.
-
 ![BotFC Dashboard](assets/Screenshot%202026-03-02%20at%2020.58.06.png)
-*BotFC Match Live Dashboard showing real-time AI telemetrics, object tracking, and robot state from the robot's point of view.*
+*BotFC Match Live Dashboard showing real-time AI telemetrics and object tracking from the robot's point of view.*
 
----
-
-## 🧠 System Architecture
-
-![BotFC AI Architecture](assets/architecture.png)
-*The BotFC Artificial Intelligence & Decision Making architecture loop, combining perception, robust C++ decision making, and adaptation.*
-
-BotFC operates on a high-frequency Perception-Decision-Action loop:
-1. **Perception**: Real-time OpenCV vision processing extracts features like ball position, distance, and robot pose.
-2. **Decision Engine**: Our custom-built, lightweight **C++ Multi-Layer Perceptron (MLP)** evaluates the telemetrics and infers the optimal state (Search, Approach, Align, Kick).
-3. **Action Execution**: The NAO robot's motor control systems execute the computed actions seamlessly.
-
----
-
-## ⚙️ Environments & Training
-
-BotFC supports a complete pipeline from synthetic data generation to physical deployment:
-
-### Simulation & Training Environment
-![Webots Simulation Engine](assets/Screenshot%202026-03-02%20at%2021.26.08.png)
-*Physics simulation built in C++ to generate synthetic telemetry data and rapidly train the custom Neural Network models.*
+An end-to-end intelligent perception and control system combining real-time computer vision and deep learning for autonomous humanoid robotics. BotFC is an advanced machine learning robotics project designed for the NAO humanoid robot platform. It integrates:
 
 ### Physical Execution
 ![Physical NAO Robot](assets/67451.jpg)
-*Real-world testing with the physical NAO humanoid robot, utilizing the generated C++ models for ball tracking and autonomous decision-making over a UDP telemetry stream.*
+*Real-world testing with the physical NAO humanoid robot, utilizing deep learning for ball tracking and autonomous decision-making.*
 
----
+### Simulation & Training Environment
+![Webots Simulation Engine](assets/Screenshot%202026-03-02%20at%2021.26.08.png)
+*Physics simulation and model training environment utilizing the Webots platform, generating synthetic data for the C++ ML engine.*
 
-## 🛠 Technology Stack
+- TensorFlow: Deep learning models for intelligent decision-making
+- OpenCV: Real-time computer vision processing
+- NAO Robot Platform: Humanoid robotic execution
 
-BotFC has been recently refactored for maximum performance on embedded hardware, dropping heavy dependencies like TensorFlow in favor of a bespoke C++ implementation.
+This system enables autonomous capabilities including object detection, tracking, and adaptive decision-making on the robotic platform.
 
-- **Core ML Engine**: Pure C++ (Multi-Layer Perceptron inference and training)
-- **Computer Vision**: OpenCV (Python/C++ bindings)
-- **Robot Interface**: Python (NAOqi SDK)
-- **Networking**: High-speed UDP telemetry streaming
-- **Dashboard**: React / Vite (Live match monitoring)
+## Key Features
 
----
+- Real-time Computer Vision: Powered by OpenCV for continuous visual perception
+- Deep Learning Models: TensorFlow-based neural networks for intelligent inference
+- Object Detection and Tracking: Identify and follow objects in the environment
+- Adaptive Decision Making: Autonomous responses based on perception and analysis
+- Humanoid Robot Integration: Seamless control and operation of NAO robot
 
-## 🚀 Getting Started
+## Technology Stack
 
-1. **Clone the repository**
+- Language: Python
+- Primary Libraries:
+  - TensorFlow: Deep learning framework
+  - OpenCV: Computer vision library
+  - NAO Robot SDK: Robot control interface
+
+## Requirements
+
+- Python 3.x
+- TensorFlow
+- OpenCV (cv2)
+- NAO Robot SDK
+- Additional dependencies (see requirements.txt if available)
+
+## Getting Started
+
+1. Clone the repository
    ```bash
    git clone https://github.com/tadeyemo32/botfc.git
    cd botfc
    ```
 
-2. **Compile the C++ ML Engine**
+2. Install dependencies
    ```bash
-   cd backend/ml
-   clang++ -std=c++17 train_model.cpp -o train_model
-   ./train_model # Generates custom weights from sim data
-   
-   cd cpp_inference
-   cmake . && make
+   pip install tensorflow opencv-python
    ```
 
-3. **Deploy the System**
-   Launch the overarching dashboard and server, which automatically deploys the brain to the robot:
+3. Configure NAO robot connection
+   - Update connection parameters for your NAO robot instance
+   - Ensure the robot is accessible on your network
+
+4. Run the system
    ```bash
-   ./run.sh balanced
+   python main.py
    ```
 
-*(Requires `robot.yaml` to be properly configured with the NAO Bot's IP and credentials).*
-
----
-
-## 📁 Project Structure
+## Project Structure
 
 ```
 botfc/
-├── README.md              # Project Documentation
-├── run.sh                 # Full system launcher
-├── deploy_brain.sh        # Robot SCP/SSH deployment script
-├── assets/                # Documentation media & images
-├── backend/
-│   ├── api/               # Dashboard telemetry API
-│   ├── brain/             # Core NAO Python interface
-│   └── ml/                # Pure C++ Simulation, Training, & Inference Engine
-└── frontend/              # Vite + React Live Match Dashboard
+├── README.md              # This file
+├── main.py               # Main entry point
+├── requirements.txt      # Python dependencies
+├── models/               # TensorFlow models
+├── vision/               # OpenCV vision processing
+├── control/              # Robot control logic
+└── utils/                # Utility functions
 ```
 
-## 📜 License & Authors
+## How It Works
 
-**Authors**: tadeyemo32, tibi-05  
-Please check the repository for license details.
+1. Perception: OpenCV processes real-time camera feed from NAO robot
+2. Analysis: TensorFlow models analyze visual data for object detection
+3. Tracking: System maintains tracking of detected objects
+4. Decision Making: Adaptive algorithms determine robot actions
+5. Execution: NAO robot performs motor commands based on decisions
+
+## Usage Examples
+
+```python
+# Example: Basic vision and detection
+from botfc import RobotController, VisionProcessor
+
+controller = RobotController()
+vision = VisionProcessor()
+
+while True:
+    frame = vision.capture()
+    detections = vision.detect_objects(frame)
+    controller.act_on_detections(detections)
+```
+
+## Configuration
+
+Configuration parameters can typically be adjusted in a config file or through environment variables. Key settings include:
+- Robot IP address and port
+- Detection confidence thresholds
+- Tracking parameters
+- Model paths
+
+## Documentation
+
+For detailed documentation on:
+- Model training and fine-tuning
+- Vision pipeline customization
+- NAO robot API reference
+- Control algorithms
+
+Please refer to the project files and inline code documentation.
+
+
+## License
+
+License information to be added. Please check the repository for license details.
+
+## Author
+
+tadeyemo32,tibi-05
+
+## Support
+
+For questions, issues, or contributions, please open an issue on GitHub or contact the repository maintainer.
 
 ---
-*Last Updated: March 2, 2026*
+
+Last Updated: March 2, 2026
