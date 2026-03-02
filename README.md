@@ -112,12 +112,6 @@ For detailed documentation on:
 
 Please refer to the project files and inline code documentation.
 
-## Contributing
-
-Contributions are welcome. Please feel free to:
-- Report issues
-- Suggest improvements
-- Submit pull requests
 
 ## License
 
@@ -125,7 +119,7 @@ License information to be added. Please check the repository for license details
 
 ## Author
 
-tadeyemo32
+tadeyemo32,tibi-05
 
 ## Support
 
@@ -134,3 +128,4 @@ For questions, issues, or contributions, please open an issue on GitHub or conta
 ---
 
 Last Updated: March 2, 2026
+
