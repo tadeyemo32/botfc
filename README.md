@@ -1,17 +1,17 @@
-# Project Overview
+# BotFC - Intelligent Autonomous Humanoid Robotics
 
-This is the project overview section.
+![BotFC Dashboard](assets/Screenshot%202026-03-02%20at%2020.58.06.png)
+*BotFC Match Live Dashboard showing real-time AI telemetrics and object tracking from the robot's point of view.*
 
-![Screenshot](assets/Screenshot%202026-03-02%20at%2020.58.06.png)
-![Other Image](assets/Screenshot%202026-03-02%20at%2021.26.08.png)
+An end-to-end intelligent perception and control system combining real-time computer vision and deep learning for autonomous humanoid robotics. BotFC is an advanced machine learning robotics project designed for the NAO humanoid robot platform. It integrates:
 
-# BotFC - TensorFlow + OpenCV Machine Learning Robot
+### Physical Execution
+![Physical NAO Robot](assets/67451.jpg)
+*Real-world testing with the physical NAO humanoid robot, utilizing deep learning for ball tracking and autonomous decision-making.*
 
-An end-to-end intelligent perception and control system combining real-time computer vision and deep learning for autonomous humanoid robotics.
-
-![BotFC Screenshot](assets/Screenshot%202026-03-02%20at%2020.58.06.png)
-
-BotFC is an advanced machine learning robotics project designed for the NAO humanoid robot platform. It integrates:
+### Simulation & Training Environment
+![Webots Simulation Engine](assets/Screenshot%202026-03-02%20at%2021.26.08.png)
+*Physics simulation and model training environment utilizing the Webots platform, generating synthetic data for the C++ ML engine.*
 
 - TensorFlow: Deep learning models for intelligent decision-making
 - OpenCV: Real-time computer vision processing
