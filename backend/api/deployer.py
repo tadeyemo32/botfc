@@ -64,20 +64,26 @@ def deploy_and_run(host: str, trait: str = "balanced") -> bool:
     server_ip = _get_local_ip(host)
     print(f"[Deployer] Upload complete. Server IP: {server_ip}")
 
-    # Kill existing brain, then launch new one
-    ssh.exec_command("pkill -f botfc_brain.py 2>/dev/null; sleep 1")
-
+    import time
+    
+    # 1. Kill synchronously and wait
+    ssh.exec_command("pkill -f botfc_brain.py")
+    time.sleep(1.0)
+    
+    # 2. Launch new brain and give the script a fraction of a second to detach
     cmd = (
-        f"export PYTHONPATH={cfg.NAOQI_PATH} && "
+        f"export PYTHONPATH={cfg.NAOQI_PATH} ; "
         f"nohup python {_REMOTE_SCRIPT}"
         f" --ip=127.0.0.1"
         f" --pport={cfg.ROBOT_PORT}"
         f" --trait={trait}"
         f" --server-ip={server_ip}"
         f" --server-port={cfg.SERVER_PORT}"
-        f" > /home/nao/botfc_brain.log 2>&1 &"
+        f" > /home/nao/botfc_brain.log 2>&1 < /dev/null &"
     )
     ssh.exec_command(cmd)
+    time.sleep(0.5)
+    
     print("[Deployer] Brain launched.")
     ssh.close()
     return True

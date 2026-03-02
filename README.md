@@ -2,13 +2,14 @@
 
 This is the project overview section.
 
-![Screenshot](https://raw.githubusercontent.com/tadeyemo32/botfc/main/Screenshot%202026-03-02%20at%2020.58.06.png)
+![Screenshot](assets/Screenshot%202026-03-02%20at%2020.58.06.png)
+![Other Image](assets/Screenshot%202026-03-02%20at%2021.26.08.png)
 
 # BotFC - TensorFlow + OpenCV Machine Learning Robot
 
 An end-to-end intelligent perception and control system combining real-time computer vision and deep learning for autonomous humanoid robotics.
 
-![BotFC Screenshot](Screenshot%202026-03-02%20at%2020.58.06.png)
+![BotFC Screenshot](assets/Screenshot%202026-03-02%20at%2020.58.06.png)
 
 BotFC is an advanced machine learning robotics project designed for the NAO humanoid robot platform. It integrates:
 

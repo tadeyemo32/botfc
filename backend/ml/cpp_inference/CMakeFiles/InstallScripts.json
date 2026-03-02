@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/tadeyemo32/dev/botfc/backend/ml/cpp_inference/cmake_install.cmake"
+	],
+	"Parallel" : false
+}
