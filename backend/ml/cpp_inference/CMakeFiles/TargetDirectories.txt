@@ -1,3 +1,0 @@
-/Users/tadeyemo32/dev/botfc/backend/ml/cpp_inference/CMakeFiles/inference_daemon.dir
-/Users/tadeyemo32/dev/botfc/backend/ml/cpp_inference/CMakeFiles/edit_cache.dir
-/Users/tadeyemo32/dev/botfc/backend/ml/cpp_inference/CMakeFiles/rebuild_cache.dir

@@ -74,3 +74,13 @@ context/
 
 # Build artifacts
 bin/
+build/
+CMakeFiles/
+CMakeCache.txt
+Makefile
+cmake_install.cmake
+*.o
+*.out
+*.bin
+*.keras
+*.tflite
