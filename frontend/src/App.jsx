@@ -5,7 +5,7 @@ const SERVER = "http://localhost:5050";
 const WS     = "ws://localhost:5050";
 
 const STATE_COLORS = {
-  IDLE: "#4d7a60", SEARCH: "#ffcc00", APPROACH: "#a8ff4d",
+  IDLE: "#4d7a60", STANDBY: "#3d6a50", SEARCH: "#ffcc00", APPROACH: "#a8ff4d",
   ALIGN: "#4d9fff", TACKLE: "#ff6b35", KICK: "#ffffff",
   HALFTIME: "#ff6600", RECOVER: "#ff4d4d", INIT: "#666",
 };
@@ -93,9 +93,10 @@ function drawOverlay(ctx, w, h, telem) {
 }
 
 // ── Camera Feed ───────────────────────────────────────────────────────────────
-function CameraFeed({ telemetry }) {
+function CameraFeed({ telemetry, compact = false }) {
   const [frame,     setFrame]     = useState(null);
   const [connected, setConnected] = useState(false);
+  const [hasStream, setHasStream] = useState(false);
   const containerRef = useRef(null);
   const canvasRef    = useRef(null);
   const wsRef        = useRef(null);
@@ -106,7 +107,11 @@ function CameraFeed({ telemetry }) {
       wsRef.current.onopen  = () => setConnected(true);
       wsRef.current.onclose = () => { setConnected(false); setTimeout(connect, 2000); };
       wsRef.current.onmessage = (e) => {
-        try { const d = JSON.parse(e.data); setFrame(d.jpg || d.frame || null); } catch (_) {}
+        try {
+          const d = JSON.parse(e.data);
+          const jpg = d.jpg || d.frame;
+          if (jpg) { setFrame(jpg); setHasStream(true); }
+        } catch (_) {}
       };
     };
     connect();
@@ -121,21 +126,48 @@ function CameraFeed({ telemetry }) {
     drawOverlay(canvas.getContext("2d"), canvas.width, canvas.height, telemetry);
   }, [telemetry, frame]);
 
+  // Badge config: streaming > connected (waiting) > offline
+  const badge = hasStream
+    ? { color: "#a8ff4d", label: "● STREAMING" }
+    : connected
+    ? { color: "#ffcc00", label: "◌ AWAITING ROBOT" }
+    : { color: "#ff4d4d44", label: "○ OFFLINE" };
+
+  const minH = compact ? "180px" : "240px";
+
   return (
-    <div style={{ position: "relative", width: "100%", aspectRatio: "4/3", background: "#000", borderRadius: 4, overflow: "hidden" }} ref={containerRef}>
+    <div style={{ position: "relative", width: "100%", aspectRatio: "4/3", minHeight: minH, background: "#000", borderRadius: 4, overflow: "hidden" }} ref={containerRef}>
       {frame
-        ? <img src={`data:image/jpeg;base64,${frame}`} alt="bot pov" style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
-        : <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 8 }}>
-            <div style={{ width: 40, height: 40, border: "2px solid #1a3a2a", borderTopColor: "#4d9fff", borderRadius: "50%", animation: "spin 1s linear infinite" }} />
-            <div style={{ color: "#1a3a2a", fontSize: "0.65rem", letterSpacing: "0.2em", fontFamily: "'Share Tech Mono', monospace" }}>AWAITING STREAM</div>
+        ? <img src={`data:image/jpeg;base64,${frame}`} alt="bot pov"
+            style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+        : <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 10 }}>
+            {connected
+              ? <>
+                  <div style={{ width: 36, height: 36, border: "2px solid #0d2010", borderTopColor: "#ffcc00", borderRadius: "50%", animation: "spin 1.2s linear infinite" }} />
+                  <div style={{ color: "#3d6a50", fontSize: "0.6rem", letterSpacing: "0.2em", fontFamily: "'Share Tech Mono', monospace", textAlign: "center", lineHeight: 1.8 }}>
+                    AWAITING ROBOT CAMERA<br/>
+                    <span style={{ color: "#1a3a2a", fontSize: "0.5rem" }}>CLICK KICK OFF TO DEPLOY BRAIN</span>
+                  </div>
+                </>
+              : <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+                  <div style={{ fontSize: "1.4rem", color: "#0d2010" }}>◯</div>
+                  <div style={{ color: "#0d2010", fontSize: "0.55rem", letterSpacing: "0.25em", fontFamily: "'Share Tech Mono', monospace" }}>SERVER OFFLINE</div>
+                </div>
+            }
           </div>
       }
       <canvas ref={canvasRef} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", pointerEvents: "none" }} />
       {/* Status badge */}
-      <div style={{ position: "absolute", top: 8, left: 8, display: "flex", alignItems: "center", gap: 5, background: "rgba(0,0,0,0.7)", padding: "3px 8px", borderRadius: 3 }}>
-        <div style={{ width: 6, height: 6, borderRadius: "50%", background: connected ? "#4d9fff" : "#333", boxShadow: connected ? "0 0 8px #4d9fff" : "none" }} />
-        <span style={{ color: connected ? "#4d9fff" : "#444", fontSize: "0.5rem", letterSpacing: "0.2em", fontFamily: "'Share Tech Mono', monospace" }}>{connected ? "LIVE" : "OFFLINE"}</span>
+      <div style={{ position: "absolute", top: 8, left: 8, display: "flex", alignItems: "center", gap: 5, background: "rgba(0,0,0,0.75)", padding: "3px 8px", borderRadius: 3, backdropFilter: "blur(4px)" }}>
+        <div style={{ width: 6, height: 6, borderRadius: "50%", background: badge.color, boxShadow: hasStream ? `0 0 8px ${badge.color}` : "none", animation: hasStream ? "pulse 2s infinite" : "none" }} />
+        <span style={{ color: badge.color, fontSize: "0.5rem", letterSpacing: "0.2em", fontFamily: "'Share Tech Mono', monospace" }}>{badge.label}</span>
       </div>
+      {/* FPS / resolution info when streaming */}
+      {hasStream && (
+        <div style={{ position: "absolute", bottom: 8, right: 8, background: "rgba(0,0,0,0.6)", padding: "2px 6px", borderRadius: 3, fontSize: "0.45rem", color: "#3d6a50", fontFamily: "'Share Tech Mono', monospace", letterSpacing: "0.1em" }}>
+          320×240 · 5fps
+        </div>
+      )}
     </div>
   );
 }
@@ -171,7 +203,7 @@ const Stat = ({ label, value, color }) => (
 );
 
 // ── Telemetry Panel ───────────────────────────────────────────────────────────
-function TelemetryPanel() {
+function TelemetryPanel({ showCamera = true }) {
   const [telem, setTelem]       = useState({
     state: "IDLE", kicks: 0, ball_age: -1, break_remaining: 0,
     battery_pct: -1, robot_connected: false,
@@ -222,8 +254,8 @@ function TelemetryPanel() {
       display: "flex", flexDirection: "column", gap: 10,
       fontFamily: "'Share Tech Mono', monospace", color: "#ccc",
     }}>
-      {/* Camera hero */}
-      <CameraFeed telemetry={telem} />
+      {/* Camera hero – hidden when the live panel is showing it in the main column */}
+      {showCamera && <CameraFeed telemetry={telem} compact />}
 
       {/* Robot link */}
       <div style={{ padding: "8px 10px", background: "#060f08", border: "1px solid #0d2010", borderRadius: 4 }}>
@@ -567,23 +599,22 @@ export default function App() {
             </div>
           )}
 
-          {/* Live state */}
+          {/* Live state – controls (camera stays in sidebar) */}
           {matchState === "live" && (
-            <div style={{ padding: "16px", background: "#040a05", border: "1px solid #a8ff4d30", borderRadius: 4, animation: "fadeUp 0.3s ease, livePulse 3s infinite" }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, animation: "fadeUp 0.3s ease" }}>
+              <div style={{ padding: "12px 16px", background: "#040a05", border: "1px solid #a8ff4d20", borderRadius: 4, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div>
                   <div style={{ fontSize: "0.5rem", color: "#3d6a50", letterSpacing: "0.2em", fontFamily: "'Share Tech Mono', monospace" }}>MATCH IN PROGRESS</div>
-                  <div style={{ fontSize: "1.5rem", fontWeight: 900, color: "#a8ff4d" }}>⚽ ROBOTS ON PITCH</div>
+                  <div style={{ display: "flex", gap: 16, marginTop: 3, fontFamily: "'Share Tech Mono', monospace", fontSize: "0.65rem", color: "#3d6a50" }}>
+                    <span style={{ color: MODE_COLORS[p1.mode] }}>{p1.name} · {p1.mode}</span>
+                    <span>vs</span>
+                    <span style={{ color: MODE_COLORS[p2.mode] }}>{p2.name} · {p2.mode}</span>
+                  </div>
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
-                  <button onClick={stop} style={{ background: "#ff4d4d", border: "none", color: "#fff", padding: "8px 20px", fontFamily: "'Barlow Condensed', sans-serif", fontSize: "0.85rem", fontWeight: 700, letterSpacing: "0.2em", cursor: "pointer", clipPath: "polygon(0 0, calc(100%-8px) 0, 100% 8px, 100% 100%, 0 100%)" }}>■ STOP</button>
+                  <button onClick={stop} style={{ background: "#ff4d4d", border: "none", color: "#fff", padding: "8px 20px", fontFamily: "'Barlow Condensed', sans-serif", fontSize: "0.85rem", fontWeight: 700, letterSpacing: "0.2em", cursor: "pointer", clipPath: "polygon(0 0, calc(100% - 8px) 0, 100% 8px, 100% 100%, 0 100%)" }}>■ STOP</button>
                   <button onClick={() => setMState("config")} style={{ background: "transparent", border: "1px solid #3d6a50", color: "#3d6a50", padding: "8px 16px", fontFamily: "'Barlow Condensed', sans-serif", fontSize: "0.75rem", letterSpacing: "0.15em", cursor: "pointer" }}>← CONFIG</button>
                 </div>
-              </div>
-              <div style={{ display: "flex", gap: 16, fontFamily: "'Share Tech Mono', monospace", fontSize: "0.65rem", color: "#3d6a50" }}>
-                <span style={{ color: MODE_COLORS[p1.mode] }}>{p1.name} · {p1.mode}</span>
-                <span>vs</span>
-                <span style={{ color: MODE_COLORS[p2.mode] }}>{p2.name} · {p2.mode}</span>
               </div>
             </div>
           )}

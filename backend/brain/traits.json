@@ -1,0 +1,23 @@
+{
+  "aggressive": {
+    "WalkVelocity": 0.9,
+    "ObstacleAvoidance": false,
+    "KickPower": 1.0,
+    "ScanFrequency": 0.3,
+    "description": "High speed, prioritises kicking"
+  },
+  "defensive": {
+    "WalkVelocity": 0.4,
+    "ObstacleAvoidance": true,
+    "KickPower": 0.5,
+    "ScanFrequency": 0.8,
+    "description": "Stays on goal vector, frequent scanning"
+  },
+  "balanced": {
+    "WalkVelocity": 0.6,
+    "ObstacleAvoidance": true,
+    "KickPower": 0.7,
+    "ScanFrequency": 0.5,
+    "description": "All-round play style"
+  }
+}
